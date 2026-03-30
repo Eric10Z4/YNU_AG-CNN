@@ -2,6 +2,12 @@ import random
 import numpy as np
 from collections import deque
 import torch
+import os
+import sys
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 from game import Board, Game
 from mcts_alphaZero import MCTSPlayer
@@ -51,8 +57,15 @@ class TrainPipeline:
         # 切除第 226 维 (无用的 Pass 动作)
         act_probs = act_probs_tensor.cpu().numpy()[0][:-1]
         value = value_tensor.cpu().numpy()[0][0]
-        
-        return zip(legal_positions, act_probs[legal_positions]), value
+
+        legal_probs = act_probs[legal_positions]
+        prob_sum = np.sum(legal_probs)
+        if prob_sum > 0:
+            legal_probs = legal_probs / prob_sum
+        else:
+            legal_probs = np.full(len(legal_positions), 1.0 / len(legal_positions), dtype=np.float32)
+
+        return zip(legal_positions, legal_probs), value
 
     def get_equi_data(self, play_data):
         # 数据增强：旋转翻转 (1局变8局)
@@ -105,21 +118,18 @@ class TrainPipeline:
         for i in range(self.epochs):
             self.policy_value_net.zero_grad()
             act_probs, value = self.policy_value_net.forward(state_batch)
-            
-            # 切除 Pass 动作对齐 225 维
-            pred_policy = act_probs[:, :-1]
-            
-            # 手算 Loss 和 梯度
+
+            # 将 225 维 MCTS 目标补齐到 226 维（pass 动作监督为 0）
+            target_policy_full = torch.zeros_like(act_probs)
+            target_policy_full[:, :-1] = mcts_probs_batch
+
+            # 手算 Loss 和 梯度（与网络 226 维输出对齐）
             total_loss, loss_v, loss_p, grad_v, grad_p = combined_loss(
-                pred_policy, value, mcts_probs_batch, winner_batch
+                act_probs, value, target_policy_full, winner_batch
             )
-            
-            # 补齐 226 维回传梯度
-            grad_p_padded = torch.zeros_like(act_probs)
-            grad_p_padded[:, :-1] = grad_p
-            
+
             # 手动反向传播与优化
-            self.policy_value_net.backward(grad_p_padded, grad_v)
+            self.policy_value_net.backward(grad_p, grad_v)
             self.optimizer.step()
             
         return total_loss.item(), loss_v.item(), loss_p.item()
@@ -138,7 +148,7 @@ class TrainPipeline:
                 play_steps = self.collect_selfplay_data()
                 print(f"Batch {i+1}: 游戏步数 {play_steps}, Buffer容量 {len(self.data_buffer)}")
                 
-                if len(self.data_buffer) > self.batch_size:
+                if len(self.data_buffer) >= self.batch_size:
                     loss, loss_v, loss_p = self.policy_update()
                     print(f"更新完毕 | Loss: {loss:.4f} (V: {loss_v:.4f}, P: {loss_p:.4f})")
                 

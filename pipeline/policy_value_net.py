@@ -66,15 +66,59 @@ class PolicyValueNet(nn.Module):
         # 策略头
         p = self.relu_policy.forward(self.policy_bn.forward(self.policy_conv.forward(x)))
         p = self.policy_flatten.forward(p)
-        policy = torch.softmax(self.policy_fc.forward(p), dim=-1)
+        policy_logits = self.policy_fc.forward(p)
+        policy = torch.softmax(policy_logits, dim=-1)
         
         # 价值头
         v = self.relu_value.forward(self.value_bn.forward(self.value_conv.forward(x)))
         v = self.value_flatten.forward(v)
         v = self.value_fc1.forward(v)
         value = self.tanh_value.forward(self.value_fc2.forward(v))
+
+        # 缓存输出，供手写 backward 使用
+        self.policy_out = policy
+        self.value_out = value
         
         return policy, value
+
+    def backward(self, grad_policy, grad_value):
+        """双头反向传播，返回输入梯度"""
+        # softmax 输出梯度 -> logits 梯度
+        # dL/dz = s * (dL/ds - sum(dL/ds * s))
+        s = self.policy_out
+        dot = torch.sum(grad_policy * s, dim=1, keepdim=True)
+        grad_policy_logits = s * (grad_policy - dot)
+
+        # policy 头回传
+        grad_p = self.policy_fc.backward(grad_policy_logits)
+        grad_p = self.policy_flatten.backward(grad_p)
+        grad_p = self.relu_policy.backward(grad_p)
+        grad_p = self.policy_bn.backward(grad_p)
+        grad_p = self.policy_conv.backward(grad_p)
+
+        # value 头回传
+        grad_v = self.tanh_value.backward(grad_value)
+        grad_v = self.value_fc2.backward(grad_v)
+        grad_v = self.value_fc1.backward(grad_v)
+        grad_v = self.value_flatten.backward(grad_v)
+        grad_v = self.relu_value.backward(grad_v)
+        grad_v = self.value_bn.backward(grad_v)
+        grad_v = self.value_conv.backward(grad_v)
+
+        # 汇合到共享干路
+        grad = grad_p + grad_v
+        grad = self.relu3.backward(grad)
+        grad = self.bn3.backward(grad)
+        grad = self.conv3.backward(grad)
+        grad = self.relu2.backward(grad)
+        grad = self.bn2.backward(grad)
+        grad = self.conv2.backward(grad)
+        grad = self.relu1.backward(grad)
+        grad = self.bn1.backward(grad)
+        grad = self.conv1.backward(grad)
+
+        self._sync_param_grads()
+        return grad
     
     def train_mode(self):
         """切换到训练模式"""
@@ -91,14 +135,7 @@ class PolicyValueNet(nn.Module):
         params = {}
         grads = {}
         
-        layers = {
-            'conv1': self.conv1, 'bn1': self.bn1,
-            'conv2': self.conv2, 'bn2': self.bn2,
-            'conv3': self.conv3, 'bn3': self.bn3,
-            'pc': self.policy_conv, 'pbn': self.policy_bn, 'pf': self.policy_fc,
-            'vc': self.value_conv, 'vbn': self.value_bn, 
-            'vf1': self.value_fc1, 'vf2': self.value_fc2
-        }
+        layers = self._named_layers()
         
         for name, layer in layers.items():
             for key in layer.params:
@@ -109,9 +146,35 @@ class PolicyValueNet(nn.Module):
     
     def zero_grad(self):
         """清空所有梯度"""
-        for layer in [self.conv1, self.bn1, self.conv2, self.bn2, self.conv3, self.bn3,
-                      self.policy_conv, self.policy_bn, self.policy_fc,
-                      self.value_conv, self.value_bn, self.value_fc1, self.value_fc2]:
-            for key in layer.grads:
-                if layer.grads[key] is not None:
+        for _, layer in self._named_layers().items():
+            for key, param in layer.params.items():
+                if key not in layer.grads or layer.grads[key] is None:
+                    layer.grads[key] = torch.zeros_like(param)
+                else:
                     layer.grads[key].zero_()
+                if param.grad is None:
+                    param.grad = torch.zeros_like(param)
+                else:
+                    param.grad.zero_()
+
+    def _named_layers(self):
+        return {
+            'conv1': self.conv1, 'bn1': self.bn1,
+            'conv2': self.conv2, 'bn2': self.bn2,
+            'conv3': self.conv3, 'bn3': self.bn3,
+            'pc': self.policy_conv, 'pbn': self.policy_bn, 'pf': self.policy_fc,
+            'vc': self.value_conv, 'vbn': self.value_bn,
+            'vf1': self.value_fc1, 'vf2': self.value_fc2
+        }
+
+    def _sync_param_grads(self):
+        """把 layer.grads 同步到 param.grad，兼容 optimizer.py"""
+        for _, layer in self._named_layers().items():
+            for key, param in layer.params.items():
+                grad = layer.grads.get(key)
+                if grad is None:
+                    param.grad = None
+                elif param.grad is None:
+                    param.grad = grad.clone()
+                else:
+                    param.grad.copy_(grad)
