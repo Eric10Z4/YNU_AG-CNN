@@ -5,6 +5,8 @@ import torch
 import os
 import sys
 from collections import defaultdict
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if ROOT_DIR not in sys.path:
@@ -44,9 +46,14 @@ class TrainPipeline:
         self.pure_mcts_playout_num = 600
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model_dir = os.path.join(ROOT_DIR, "models")
+        self.log_dir = os.path.join(ROOT_DIR, "runs")
         self.current_model_path = os.path.join(self.model_dir, "current_policy.pth")
         self.best_model_path = os.path.join(self.model_dir, "best_policy.pth")
+        run_name = datetime.now().strftime("gomoku_15x15_%Y%m%d_%H%M%S")
+        self.tb_run_dir = os.path.join(self.log_dir, run_name)
         os.makedirs(self.model_dir, exist_ok=True)
+        os.makedirs(self.tb_run_dir, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=self.tb_run_dir)
 
         # 网络与优化器
         self.policy_value_net = PolicyValueNet(self.board_width, num_channels=64, device=self.device)
@@ -56,6 +63,8 @@ class TrainPipeline:
         # MCTS 玩家
         self.mcts_player = MCTSPlayer(self.policy_value_fn, self.c_puct, self.n_playout, is_selfplay=1)
         self.episode_len = 0
+        self.train_step = 0
+        self.selfplay_step = 0
 
     def policy_value_fn(self, board):
         # 桥接层：环境态 -> MCTS 概率
@@ -122,6 +131,9 @@ class TrainPipeline:
                     play_data = list(zip(states, mcts_probs, winners_z))
                     self.episode_len = len(play_data)
                     self.data_buffer.extend(self.get_equi_data(play_data))
+                    self.selfplay_step += 1
+                    self.writer.add_scalar("selfplay/episode_len", self.episode_len, self.selfplay_step)
+                    self.writer.add_scalar("selfplay/buffer_size", len(self.data_buffer), self.selfplay_step)
                     break
 
     def policy_update(self):
@@ -179,7 +191,17 @@ class TrainPipeline:
             f"loss:{total_loss.item():.4f}, v_loss:{loss_v.item():.4f}, p_loss:{loss_p.item():.4f}, "
             f"ev_old:{explained_var_old.item():.3f}, ev_new:{explained_var_new.item():.3f}"
         )
-             
+
+        self.train_step += 1
+        self.writer.add_scalar("train/loss_total", total_loss.item(), self.train_step)
+        self.writer.add_scalar("train/loss_value", loss_v.item(), self.train_step)
+        self.writer.add_scalar("train/loss_policy", loss_p.item(), self.train_step)
+        self.writer.add_scalar("train/kl", kl, self.train_step)
+        self.writer.add_scalar("train/lr", self.optimizer.lr, self.train_step)
+        self.writer.add_scalar("train/lr_multiplier", self.lr_multiplier, self.train_step)
+        self.writer.add_scalar("train/explained_var_old", explained_var_old.item(), self.train_step)
+        self.writer.add_scalar("train/explained_var_new", explained_var_new.item(), self.train_step)
+              
         return total_loss.item(), loss_v.item(), loss_p.item()
     
     def policy_evaluate(self, n_games=10):
@@ -201,6 +223,8 @@ class TrainPipeline:
             f"num_playouts:{self.pure_mcts_playout_num}, "
             f"win:{win_cnt[1]}, lose:{win_cnt[2]}, tie:{win_cnt[-1]}"
         )
+        self.writer.add_scalar("eval/win_ratio", win_ratio, self.train_step)
+        self.writer.add_scalar("eval/pure_mcts_playout_num", self.pure_mcts_playout_num, self.train_step)
         return win_ratio
 
     def _capture_model_state(self):
@@ -239,9 +263,13 @@ class TrainPipeline:
                         if self.best_win_ratio == 1.0 and self.pure_mcts_playout_num < 5000:
                             self.pure_mcts_playout_num += 1000
                             self.best_win_ratio = 0.0
+                self.writer.add_scalar("train/batch_index", i + 1, i + 1)
                     
         except KeyboardInterrupt:
             print("\n训练终止")
+        finally:
+            self.writer.flush()
+            self.writer.close()
 
 if __name__ == '__main__':
     pipeline = TrainPipeline()
