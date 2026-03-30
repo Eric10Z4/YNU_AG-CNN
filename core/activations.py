@@ -12,7 +12,7 @@ class ReLU(Layer):
         res=torch.maximum(x,torch.tensor(0.0,device=x.device))#一定要是在统一设备的标量
         return res
     
-    def backward(self, grad_output):
+    def backward(self, grad_output): #FUCK JMY！！！
         flag=(self.x>0).float()
         grad_input=grad_output*flag
         return grad_input

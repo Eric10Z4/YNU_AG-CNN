@@ -6,7 +6,7 @@ import os
 import sys
 from collections import defaultdict
 from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter  # TensorBoard 日志写入器
+from torch.utils.tensorboard import SummaryWriter
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if ROOT_DIR not in sys.path:
