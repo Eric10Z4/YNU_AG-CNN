@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'core'))
 
 from conv import Conv2D
 from batchnorm import BatchNorm2D
-from activations import ReLU
+from activations import ReLU, Tanh
 from Flatten import Flatten
 from linear import Linear
 
@@ -48,23 +48,31 @@ class PolicyValueNet(nn.Module):
         self.value_flatten = Flatten(device=device)
         self.value_fc1 = Linear(board_size * board_size, 128, device=device)
         self.value_fc2 = Linear(128, 1, device=device)
+
+        # 激活层（复用实例，便于后续反向传播缓存）
+        self.relu1 = ReLU(device=device)
+        self.relu2 = ReLU(device=device)
+        self.relu3 = ReLU(device=device)
+        self.relu_policy = ReLU(device=device)
+        self.relu_value = ReLU(device=device)
+        self.tanh_value = Tanh(device=device)
         
     def forward(self, x):
         # 公共特征提取
-        x = nn.functional.relu(self.bn1.forward(self.conv1.forward(x)))
-        x = nn.functional.relu(self.bn2.forward(self.conv2.forward(x)))
-        x = nn.functional.relu(self.bn3.forward(self.conv3.forward(x)))
+        x = self.relu1.forward(self.bn1.forward(self.conv1.forward(x)))
+        x = self.relu2.forward(self.bn2.forward(self.conv2.forward(x)))
+        x = self.relu3.forward(self.bn3.forward(self.conv3.forward(x)))
         
         # 策略头
-        p = nn.functional.relu(self.policy_bn.forward(self.policy_conv.forward(x)))
+        p = self.relu_policy.forward(self.policy_bn.forward(self.policy_conv.forward(x)))
         p = self.policy_flatten.forward(p)
         policy = torch.softmax(self.policy_fc.forward(p), dim=-1)
         
         # 价值头
-        v = nn.functional.relu(self.value_bn.forward(self.value_conv.forward(x)))
+        v = self.relu_value.forward(self.value_bn.forward(self.value_conv.forward(x)))
         v = self.value_flatten.forward(v)
         v = self.value_fc1.forward(v)
-        value = torch.tanh(self.value_fc2.forward(v))
+        value = self.tanh_value.forward(self.value_fc2.forward(v))
         
         return policy, value
     
