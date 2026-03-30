@@ -6,7 +6,7 @@ import os
 import sys
 from collections import defaultdict
 from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter  # TensorBoard 日志写入器
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if ROOT_DIR not in sys.path:
@@ -46,14 +46,14 @@ class TrainPipeline:
         self.pure_mcts_playout_num = 600
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model_dir = os.path.join(ROOT_DIR, "models")
-        self.log_dir = os.path.join(ROOT_DIR, "runs")
+        self.log_dir = os.path.join(ROOT_DIR, "runs")  # TensorBoard 根目录
         self.current_model_path = os.path.join(self.model_dir, "current_policy.pth")
         self.best_model_path = os.path.join(self.model_dir, "best_policy.pth")
-        run_name = datetime.now().strftime("gomoku_15x15_%Y%m%d_%H%M%S")
+        run_name = datetime.now().strftime("gomoku_15x15_%Y%m%d_%H%M%S")  # 每次训练单独子目录
         self.tb_run_dir = os.path.join(self.log_dir, run_name)
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.tb_run_dir, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=self.tb_run_dir)
+        self.writer = SummaryWriter(log_dir=self.tb_run_dir)  # 初始化 TensorBoard writer
 
         # 网络与优化器
         self.policy_value_net = PolicyValueNet(self.board_width, num_channels=64, device=self.device)
@@ -63,8 +63,8 @@ class TrainPipeline:
         # MCTS 玩家
         self.mcts_player = MCTSPlayer(self.policy_value_fn, self.c_puct, self.n_playout, is_selfplay=1)
         self.episode_len = 0
-        self.train_step = 0
-        self.selfplay_step = 0
+        self.train_step = 0      # 训练更新步（用于 train/eval 曲线横轴）
+        self.selfplay_step = 0   # 自对弈局数（用于 selfplay 曲线横轴）
 
     def policy_value_fn(self, board):
         # 桥接层：环境态 -> MCTS 概率
@@ -132,6 +132,7 @@ class TrainPipeline:
                     self.episode_len = len(play_data)
                     self.data_buffer.extend(self.get_equi_data(play_data))
                     self.selfplay_step += 1
+                    # 记录自对弈产数质量与数据池规模
                     self.writer.add_scalar("selfplay/episode_len", self.episode_len, self.selfplay_step)
                     self.writer.add_scalar("selfplay/buffer_size", len(self.data_buffer), self.selfplay_step)
                     break
@@ -193,6 +194,7 @@ class TrainPipeline:
         )
 
         self.train_step += 1
+        # 记录训练主指标
         self.writer.add_scalar("train/loss_total", total_loss.item(), self.train_step)
         self.writer.add_scalar("train/loss_value", loss_v.item(), self.train_step)
         self.writer.add_scalar("train/loss_policy", loss_p.item(), self.train_step)
@@ -223,6 +225,7 @@ class TrainPipeline:
             f"num_playouts:{self.pure_mcts_playout_num}, "
             f"win:{win_cnt[1]}, lose:{win_cnt[2]}, tie:{win_cnt[-1]}"
         )
+        # 记录评估胜率与当前评估强度
         self.writer.add_scalar("eval/win_ratio", win_ratio, self.train_step)
         self.writer.add_scalar("eval/pure_mcts_playout_num", self.pure_mcts_playout_num, self.train_step)
         return win_ratio
@@ -268,6 +271,7 @@ class TrainPipeline:
         except KeyboardInterrupt:
             print("\n训练终止")
         finally:
+            # 确保日志落盘，避免中断导致 TensorBoard 数据丢失
             self.writer.flush()
             self.writer.close()
 
