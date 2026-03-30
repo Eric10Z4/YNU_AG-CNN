@@ -27,21 +27,21 @@ class TrainPipeline:
         self.game = Game(self.board)
         
         # 训练超参
-        self.learn_rate = 2e-3
+        self.learn_rate = 1.5e-3
         self.lr_multiplier = 1.0
         self.temp = 1.0
-        self.n_playout = 400
+        self.n_playout = 200
         self.c_puct = 5
-        self.batch_size = 512
+        self.batch_size = 256
         self.buffer_size = 10000
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
-        self.epochs = 5
+        self.epochs = 3
         self.kl_targ = 0.02
         self.check_freq = 50  # 每 50 次迭代评估一次模型
         self.game_batch_num = 1500
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 1000
+        self.pure_mcts_playout_num = 600
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model_dir = os.path.join(ROOT_DIR, "models")
         self.current_model_path = os.path.join(self.model_dir, "current_policy.pth")
@@ -49,7 +49,7 @@ class TrainPipeline:
         os.makedirs(self.model_dir, exist_ok=True)
 
         # 网络与优化器
-        self.policy_value_net = PolicyValueNet(self.board_width, num_channels=128, device=self.device)
+        self.policy_value_net = PolicyValueNet(self.board_width, num_channels=64, device=self.device)
         params, _ = self.policy_value_net.get_all_params()
         self.optimizer = Adam(params, lr=self.learn_rate)
         
