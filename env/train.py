@@ -29,29 +29,29 @@ from pipeline.losses import combined_loss
 class TrainPipeline:
     def __init__(self):
         # 基础参数
-        self.board_width, self.board_height, self.n_in_row = 15, 15, 5
+        self.board_width, self.board_height, self.n_in_row = 8, 8, 5
         self.board = Board(self.board_width, self.board_height, self.n_in_row)
         self.game = Game(self.board)
 
         # 训练超参
-        self.learn_rate = 1.5e-3
+        self.learn_rate = 1.0e-3
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.seed = 42
-        self.n_playout = 200
+        self.n_playout = 120
         self.c_puct = 5
-        self.batch_size = 256
-        self.buffer_size = 10000
+        self.batch_size = 128
+        self.buffer_size = 5000
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
         self.epochs = 3
         self.kl_targ = 0.02
-        self.check_freq = 50  # 每 50 次迭代评估一次模型
+        self.check_freq = 25  # 每 25 次迭代评估一次模型
         self.game_batch_num = 1500
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 600
+        self.pure_mcts_playout_num = 300
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.opening_temp_moves = 40
+        self.opening_temp_moves = 16
         self.opening_temp = 1.0
         self.endgame_temp = 1e-3
         self.kl_explosion_threshold = self.kl_targ * 8
@@ -63,7 +63,7 @@ class TrainPipeline:
         self.current_model_path = os.path.join(self.model_dir, "current_policy.pth")
         self.best_model_path = os.path.join(self.model_dir, "best_policy.pth")
         self.healthy_model_path = os.path.join(self.model_dir, "healthy_policy.pth")
-        run_name = datetime.now().strftime("gomoku_15x15_%Y%m%d_%H%M%S")  # 每次训练单独子目录
+        run_name = datetime.now().strftime(f"gomoku_{self.board_width}x{self.board_height}_%Y%m%d_%H%M%S")  # 每次训练单独子目录
         self.tb_run_dir = os.path.join(self.log_dir, run_name)
         self.train_log_path = os.path.join(self.tb_run_dir, "train.log")
         self.config_snapshot_path = os.path.join(self.tb_run_dir, "config_snapshot.json")
@@ -246,7 +246,7 @@ class TrainPipeline:
                     break
 
     def _get_dynamic_temp(self, move_idx):
-        if self.board_width == 15 and self.board_height == 15:
+        if self.board_width == 8 and self.board_height == 8:
             return self.opening_temp if move_idx < self.opening_temp_moves else self.endgame_temp
         return self.temp
 
