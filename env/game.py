@@ -67,6 +67,11 @@ class Board(object):
 
     def do_move(self, move):
         """执行落子动作并切换玩家"""
+        if move not in self.availables:
+            raise ValueError(
+                f"非法落子: move={move}, current_player={self.current_player}, "
+                f"availables_size={len(self.availables)}, last_move={self.last_move}"
+            )
         self.states[move] = self.current_player
         self.availables.remove(move)
         self.current_player = (
@@ -165,6 +170,10 @@ class Game(object):
         p1, p2 = self.board.players
         player1.set_player_ind(p1)
         player2.set_player_ind(p2)
+        if hasattr(player1, "reset_player"):
+            player1.reset_player()
+        if hasattr(player2, "reset_player"):
+            player2.reset_player()
         players = {p1: player1, p2: player2}
         
         if is_shown:
@@ -173,6 +182,8 @@ class Game(object):
         while True:
             current_player = self.board.current_player
             player_in_turn = players[current_player]
+            if hasattr(player_in_turn, "update_with_move") and self.board.last_move != -1:
+                player_in_turn.update_with_move(self.board.last_move)
             
             # 向玩家索要动作 (如果是人类就弹出 input，如果是 AI 就跑 MCTS)
             move = player_in_turn.get_action(self.board)

@@ -131,6 +131,9 @@ class MCTSPlayer(object):
     def reset_player(self):
         self.mcts.update_with_move(-1)
 
+    def update_with_move(self, last_move):
+        self.mcts.update_with_move(last_move)
+
     def get_action(self, board, temp=1e-3, return_prob=0):
         """根据当前棋盘状态返回执行动作。"""
         sensible_moves = board.availables
@@ -138,7 +141,23 @@ class MCTSPlayer(object):
         
         if len(sensible_moves) > 0:
             acts, probs = self.mcts.get_move_probs(board, temp)
-            move_probs[list(acts)] = probs
+            legal_set = set(sensible_moves)
+            legal_pairs = [(a, p) for a, p in zip(acts, probs) if a in legal_set]
+            if not legal_pairs:
+                # 搜索树可能与当前棋盘不同步，重置后基于当前盘面重算一次
+                self.mcts.update_with_move(-1)
+                acts, probs = self.mcts.get_move_probs(board, temp)
+                legal_pairs = [(a, p) for a, p in zip(acts, probs) if a in legal_set]
+                if not legal_pairs:
+                    raise ValueError(
+                        f"MCTS 未返回任何合法动作: availables={len(sensible_moves)}, "
+                        f"tree_children={len(self.mcts._root._children)}"
+                    )
+
+            acts = np.array([a for a, _ in legal_pairs], dtype=np.int64)
+            probs = np.array([p for _, p in legal_pairs], dtype=np.float64)
+            probs = probs / np.sum(probs)
+            move_probs[acts.tolist()] = probs
             
             if self._is_selfplay:
                 # 训练模式：增加 Dirichlet 噪声以提升探索多样性
