@@ -23,6 +23,20 @@ class Board(object):
         self.states = {}  # 记录棋盘状态。键: move(int), 值: player(int)
         self.last_move = -1  # 记录最后一步棋，用于加速胜负判定
 
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        result.width = self.width
+        result.height = self.height
+        result.n_in_row = self.n_in_row
+        result.players = self.players[:]
+        result.current_player = self.current_player
+        result.availables = self.availables[:]
+        result.states = dict(self.states)
+        result.last_move = self.last_move
+        return result
+
     def move_to_location(self, move):
         """降维: 1D -> 2D"""
         h = move // self.width

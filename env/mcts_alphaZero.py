@@ -79,11 +79,16 @@ class MCTS(object):
 
         # 2. 评估 (Evaluation): 呼叫神经网络
         action_probs, leaf_value = self._policy(state)
+        legal_set = set(state.availables)
+        legal_action_probs = [(a, p) for a, p in action_probs if a in legal_set]
+        if not legal_action_probs and len(state.availables) > 0:
+            uniform_p = 1.0 / len(state.availables)
+            legal_action_probs = [(a, uniform_p) for a in state.availables]
 
         # 3. 扩展 (Expansion) 或 结算真实胜负
         end, winner = state.game_end()
         if not end:
-            node.expand(action_probs)
+            node.expand(legal_action_probs)
         else:
             if winner == -1:  # 平局
                 leaf_value = 0.0
