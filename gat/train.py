@@ -29,29 +29,28 @@ from pipeline.losses import combined_loss
 class TrainPipeline:
     def __init__(self):
         # 基础参数
-        self.board_width, self.board_height, self.n_in_row = 8, 8, 5
-        self.board = Board(self.board_width, self.board_height, self.n_in_row)
-        self.game = Game(self.board)
-
-        # 训练超参
-        self.learn_rate = 1.0e-3
+        self.board_width = 11
+        self.board_height = 11
+        self.n_in_row = 5
+        self.learn_rate = 2.0e-3
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.seed = 42
-        self.n_playout = 120
+        self.n_playout = 400
         self.c_puct = 5
-        self.batch_size = 128
-        self.buffer_size = 5000
+        self.batch_size = 512
+        self.buffer_size = 100000
+        self.board_area = self.board_width * self.board_height
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
-        self.epochs = 3
+        self.epochs = 5
         self.kl_targ = 0.02
-        self.check_freq = 25  # 每 25 次迭代评估一次模型
-        self.game_batch_num = 1500
+        self.check_freq = 50 
+        self.game_batch_num = 2000
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 300
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.opening_temp_moves = 16
+        self.pure_mcts_playout_num = 1000
+        self.device, self.device_reason = self._resolve_device()
+        self.opening_temp_moves = 6
         self.opening_temp = 1.0
         self.endgame_temp = 1e-3
         self.kl_explosion_threshold = self.kl_targ * 8
@@ -59,11 +58,11 @@ class TrainPipeline:
         self.eval_decline_patience = 10
         self.nan_retry_limit = 1
         self.model_dir = os.path.join(ROOT_DIR, "models")
-        self.log_dir = os.path.join(ROOT_DIR, "runs")  # TensorBoard 根目录
+        self.log_dir = os.path.join(ROOT_DIR, "runs")
         self.current_model_path = os.path.join(self.model_dir, "current_policy.pth")
         self.best_model_path = os.path.join(self.model_dir, "best_policy.pth")
         self.healthy_model_path = os.path.join(self.model_dir, "healthy_policy.pth")
-        run_name = datetime.now().strftime(f"gomoku_{self.board_width}x{self.board_height}_%Y%m%d_%H%M%S")  # 每次训练单独子目录
+        run_name = datetime.now().strftime(f"gomoku_{self.board_width}x{self.board_height}_%Y%m%d_%H%M%S")
         self.tb_run_dir = os.path.join(self.log_dir, run_name)
         self.train_log_path = os.path.join(self.tb_run_dir, "train.log")
         self.config_snapshot_path = os.path.join(self.tb_run_dir, "config_snapshot.json")
@@ -71,15 +70,26 @@ class TrainPipeline:
         os.makedirs(self.model_dir, exist_ok=True)
         os.makedirs(self.tb_run_dir, exist_ok=True)
         self.logger = self._init_logger()
-        self.writer = SummaryWriter(log_dir=self.tb_run_dir)  # 初始化 TensorBoard writer
+        self._configure_torch_runtime()
+        self._log(f"训练设备: {self.device} ({self.device_reason})")
+        if self.device == 'cuda':
+            self._log(f"GPU: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+        self.writer = SummaryWriter(log_dir=self.tb_run_dir)
         self._set_seed(self.seed)
         self._save_config_snapshot()
         self._init_eval_csv()
+
+        # 棋盘与对局环境
+        self.board = Board(width=self.board_width, height=self.board_height, n_in_row=self.n_in_row)
+        self.game = Game(self.board)
 
         # 网络与优化器
         self.policy_value_net = PolicyValueNet(self.board_width, num_channels=64, device=self.device)
         params, _ = self.policy_value_net.get_all_params()
         self.optimizer = Adam(params, lr=self.learn_rate)
+        first_param = next(iter(params.values())) if params else None
+        if first_param is not None:
+            self._log(f"网络参数设备: {first_param.device}")
 
         # MCTS 玩家
         self.mcts_player = MCTSPlayer(self.policy_value_fn, self.c_puct, self.n_playout, is_selfplay=1)
@@ -123,8 +133,29 @@ class TrainPipeline:
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
+        if self.device == 'cuda':
             torch.cuda.manual_seed_all(seed)
+
+    def _resolve_device(self):
+        if not torch.cuda.is_available():
+            return 'cpu', 'torch.cuda.is_available()=False'
+        try:
+            torch.cuda.set_device(0)
+            _ = torch.zeros(1, device='cuda')
+            name = torch.cuda.get_device_name(0)
+            return 'cuda', f'CUDA ready on {name}'
+        except Exception as exc:
+            return 'cpu', f'CUDA init failed, fallback to CPU: {exc}'
+
+    def _configure_torch_runtime(self):
+        if self.device != 'cuda':
+            return
+        if hasattr(torch.backends, 'cudnn'):
+            torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends, 'cudnn'):
+            torch.backends.cudnn.allow_tf32 = True
 
     def _save_config_snapshot(self):
         config = {
@@ -180,8 +211,18 @@ class TrainPipeline:
         with torch.no_grad():
             act_probs_tensor, value_tensor = self.policy_value_net.forward(state_tensor)
 
-        # 切除第 226 维 (无用的 Pass 动作)
-        act_probs = act_probs_tensor.cpu().numpy()[0][:-1]
+        # 按棋盘尺寸动态适配策略维度（兼容带/不带 pass 动作输出）
+        act_probs_full = act_probs_tensor.cpu().numpy()[0]
+        if act_probs_full.shape[0] == self.board_area + 1:
+            act_probs = act_probs_full[:-1]
+        elif act_probs_full.shape[0] == self.board_area:
+            act_probs = act_probs_full
+        elif act_probs_full.shape[0] > self.board_area:
+            act_probs = act_probs_full[:self.board_area]
+        else:
+            raise ValueError(
+                f"策略输出维度不足: got={act_probs_full.shape[0]}, expected>={self.board_area}"
+            )
         value = value_tensor.cpu().numpy()[0][0]
 
         if len(legal_positions) == 0:
@@ -290,11 +331,20 @@ class TrainPipeline:
                     self.policy_value_net.zero_grad()
                     act_probs, value = self.policy_value_net.forward(state_batch)
 
-                    # 将 225 维 MCTS 目标补齐到 226 维（pass 动作监督为 0）
-                    target_policy_full = torch.zeros_like(act_probs)
-                    target_policy_full[:, :-1] = mcts_probs_batch
+                    # 动态对齐 MCTS 目标与网络输出维度
+                    if act_probs.shape[1] == mcts_probs_batch.shape[1] + 1:
+                        target_policy_full = torch.zeros_like(act_probs)
+                        target_policy_full[:, :-1] = mcts_probs_batch
+                        entropy_probs = act_probs[:, :-1]
+                    elif act_probs.shape[1] == mcts_probs_batch.shape[1]:
+                        target_policy_full = mcts_probs_batch
+                        entropy_probs = act_probs
+                    else:
+                        raise FloatingPointError(
+                            f"策略维度不匹配: net={act_probs.shape[1]}, target={mcts_probs_batch.shape[1]}"
+                        )
 
-                    # 手算 Loss 和 梯度（与网络 226 维输出对齐）
+                    # 手算 Loss 和 梯度（与网络输出维度对齐）
                     total_loss, loss_v, loss_p, grad_v, grad_p = combined_loss(
                         act_probs, value, target_policy_full, winner_batch
                     )
@@ -303,7 +353,7 @@ class TrainPipeline:
                         raise FloatingPointError("Loss 出现 NaN/Inf")
 
                     policy_entropy = torch.mean(
-                        -torch.sum(act_probs[:, :-1] * torch.log(act_probs[:, :-1] + 1e-10), dim=1)
+                        -torch.sum(entropy_probs * torch.log(entropy_probs + 1e-10), dim=1)
                     )
 
                     # 手动反向传播与优化
@@ -459,7 +509,7 @@ class TrainPipeline:
             "python_rng_state": random.getstate(),
             "numpy_rng_state": np.random.get_state(),
             "torch_rng_state": torch.get_rng_state(),
-            "torch_cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "torch_cuda_rng_state": torch.cuda.get_rng_state_all() if self.device == 'cuda' else None,
         }
         tmp_path = f"{path}.tmp"
         torch.save(checkpoint, tmp_path)
@@ -468,7 +518,7 @@ class TrainPipeline:
     def _load_model(self, path, restore_training_state=True):
         if not os.path.exists(path):
             return False
-        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if "model_state" not in checkpoint:
             return False
         self._restore_model_state(checkpoint["model_state"])
@@ -499,7 +549,7 @@ class TrainPipeline:
             np.random.set_state(checkpoint["numpy_rng_state"])
         if checkpoint.get("torch_rng_state") is not None:
             torch.set_rng_state(checkpoint["torch_rng_state"])
-        if torch.cuda.is_available() and checkpoint.get("torch_cuda_rng_state") is not None:
+        if self.device == 'cuda' and checkpoint.get("torch_cuda_rng_state") is not None:
             torch.cuda.set_rng_state_all(checkpoint["torch_cuda_rng_state"])
         return True
 

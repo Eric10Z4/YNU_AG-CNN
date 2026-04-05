@@ -143,47 +143,51 @@ class CppSelfPlayPlayer:
 
 
 class TrainPipeline:
-    def __init__(self):
+    def __init__(self, board_size=11, n_in_row=5, fresh_start=False):
         # 基础参数
-        self.board_width, self.board_height, self.n_in_row = 8, 8, 5
+        self.board_width, self.board_height, self.n_in_row = int(board_size), int(board_size), int(n_in_row)
+        if self.board_width < self.n_in_row:
+            raise ValueError("board_size 不能小于 n_in_row")
+        self.board_area = self.board_width * self.board_height
+        self.fresh_start = bool(fresh_start)
         self.board = Board(self.board_width, self.board_height, self.n_in_row)
         self.game = Game(self.board)
 
         # 训练超参
-        self.learn_rate = 1.0e-3
+        self.learn_rate = 1.2e-3
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.seed = 42
         self.cpu_count = max(1, multiprocessing.cpu_count())
-        self.n_playout = 120
+        self.n_playout = 768
         self.c_puct = 5
         self.selfplay_backend = "cpp"
         self.eval_backend = "cpp"
-        # 默认使用物理核近似值，避免 128 线程机器上超线程抢占过重
-        self.cpp_threads = max(1, min(64, self.cpu_count // 2))
+        # 默认线程数偏稳健，避免高线程争用吞掉有效吞吐
+        self.cpp_threads = max(4, min(16, self.cpu_count // 8))
         self.torch_cpu_threads = 1
         self.torch_interop_threads = 1
-        self.batch_size = 128
-        self.buffer_size = 5000
+        self.batch_size = 512
+        self.buffer_size = 150000
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
         self.selfplay_async_enabled = True
         self.selfplay_worker_count = 2
-        self.selfplay_prefetch_games = 6
+        self.selfplay_prefetch_games = 10
         self.selfplay_queue_timeout_sec = 30.0
-        self.epochs = 3
+        self.epochs = 6
         self.kl_targ = 0.02
-        self.check_freq = 25  # 每 25 次迭代评估一次模型
-        self.game_batch_num = 1500
+        self.check_freq = 150  # 强度优先：降低评估频率，留更多时间给高 playout 训练
+        self.game_batch_num = 12000
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 300
+        self.pure_mcts_playout_num = 2400
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.opening_temp_moves = 16
+        self.opening_temp_moves = 6
         self.opening_temp = 1.0
         self.endgame_temp = 1e-3
         self.kl_explosion_threshold = self.kl_targ * 8
-        self.high_kl_patience = 10
-        self.eval_decline_patience = 10
+        self.high_kl_patience = 20
+        self.eval_decline_patience = 30
         self.nan_retry_limit = 1
         self.model_dir = os.path.join(ROOT_DIR, "models")
         self.log_dir = os.path.join(ROOT_DIR, "runs")  # TensorBoard 根目录
@@ -230,12 +234,16 @@ class TrainPipeline:
         self.selfplay_stop_event = threading.Event()
         self.selfplay_workers = []
 
-        resumed = self._load_model(self.current_model_path, restore_training_state=True)
-        if resumed:
-            self._log(f"已从断点恢复训练: {self.current_model_path}")
-        else:
+        if self.fresh_start:
             self._save_model(self.healthy_model_path, include_buffer=False)
-            self._log("未发现断点，开始全新训练")
+            self._log("已启用 fresh-start，忽略历史断点并从零训练")
+        else:
+            resumed = self._load_model(self.current_model_path, restore_training_state=True)
+            if resumed:
+                self._log(f"已从断点恢复训练: {self.current_model_path}")
+            else:
+                self._save_model(self.healthy_model_path, include_buffer=False)
+                self._log("未发现断点，开始全新训练")
 
     def _init_logger(self):
         logger = logging.getLogger(f"train_pipeline_{os.path.basename(self.tb_run_dir)}")
@@ -574,8 +582,18 @@ class TrainPipeline:
         with torch.no_grad():
             act_probs_tensor, value_tensor = self.policy_value_net.forward(state_tensor)
 
-        # 切除第 226 维 (无用的 Pass 动作)
-        act_probs = act_probs_tensor.cpu().numpy()[0][:-1]
+        # 动态适配策略维度（兼容带/不带 pass 动作）
+        act_probs_full = act_probs_tensor.cpu().numpy()[0]
+        if act_probs_full.shape[0] == self.board_area + 1:
+            act_probs = act_probs_full[:-1]
+        elif act_probs_full.shape[0] == self.board_area:
+            act_probs = act_probs_full
+        elif act_probs_full.shape[0] > self.board_area:
+            act_probs = act_probs_full[:self.board_area]
+        else:
+            raise ValueError(
+                f"策略输出维度不足: got={act_probs_full.shape[0]}, expected>={self.board_area}"
+            )
         value = value_tensor.cpu().numpy()[0][0]
 
         if len(legal_positions) == 0:
@@ -675,11 +693,20 @@ class TrainPipeline:
                     self.policy_value_net.zero_grad()
                     act_probs, value = self.policy_value_net.forward(state_batch)
 
-                    # 将 225 维 MCTS 目标补齐到 226 维（pass 动作监督为 0）
-                    target_policy_full = torch.zeros_like(act_probs)
-                    target_policy_full[:, :-1] = mcts_probs_batch
+                    # 动态对齐 MCTS 目标与网络输出维度
+                    if act_probs.shape[1] == mcts_probs_batch.shape[1] + 1:
+                        target_policy_full = torch.zeros_like(act_probs)
+                        target_policy_full[:, :-1] = mcts_probs_batch
+                        entropy_probs = act_probs[:, :-1]
+                    elif act_probs.shape[1] == mcts_probs_batch.shape[1]:
+                        target_policy_full = mcts_probs_batch
+                        entropy_probs = act_probs
+                    else:
+                        raise FloatingPointError(
+                            f"策略维度不匹配: net={act_probs.shape[1]}, target={mcts_probs_batch.shape[1]}"
+                        )
 
-                    # 手算 Loss 和 梯度（与网络 226 维输出对齐）
+                    # 手算 Loss 和 梯度（与网络输出维度对齐）
                     total_loss, loss_v, loss_p, grad_v, grad_p = combined_loss(
                         act_probs, value, target_policy_full, winner_batch
                     )
@@ -688,7 +715,7 @@ class TrainPipeline:
                         raise FloatingPointError("Loss 出现 NaN/Inf")
 
                     policy_entropy = torch.mean(
-                        -torch.sum(act_probs[:, :-1] * torch.log(act_probs[:, :-1] + 1e-10), dim=1)
+                        -torch.sum(entropy_probs * torch.log(entropy_probs + 1e-10), dim=1)
                     )
 
                     # 手动反向传播与优化
@@ -852,9 +879,13 @@ class TrainPipeline:
 
     def _restore_model_state(self, model_state):
         params, _ = self.policy_value_net.get_all_params()
+        loaded_keys = 0
         for name, tensor in model_state.items():
             if name in params and params[name] is not None:
-                params[name].data.copy_(tensor.to(params[name].device))
+                if tuple(params[name].shape) == tuple(tensor.shape):
+                    params[name].data.copy_(tensor.to(params[name].device))
+                    loaded_keys += 1
+        return loaded_keys
 
     def _capture_optimizer_state(self):
         state = {}
@@ -913,10 +944,13 @@ class TrainPipeline:
     def _load_model(self, path, restore_training_state=True):
         if not os.path.exists(path):
             return False
-        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if "model_state" not in checkpoint:
             return False
-        self._restore_model_state(checkpoint["model_state"])
+        loaded_keys = self._restore_model_state(checkpoint["model_state"])
+        if loaded_keys == 0:
+            # 常见于 8x8 checkpoint 误加载到 11x11 模型，直接按未命中处理
+            return False
         self._restore_optimizer_state(checkpoint.get("optimizer_state"))
         if not restore_training_state:
             return True
@@ -1015,6 +1049,9 @@ class TrainPipeline:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train pipeline with optional C++ selfplay backend")
+    parser.add_argument("--board-size", type=int, default=11, help="棋盘边长 N（n*n）")
+    parser.add_argument("--n-in-row", type=int, default=5, help="连珠数")
+    parser.add_argument("--fresh-start", action="store_true", help="忽略已有断点，从零开始训练")
     parser.add_argument("--selfplay-backend", choices=["cpp", "python"], default="cpp", help="自对弈搜索后端")
     parser.add_argument("--eval-backend", choices=["cpp", "python"], default="cpp", help="评估搜索后端")
     parser.add_argument("--cpp-threads", type=int, default=None, help="C++ 自对弈线程数，默认自动按 CPU 核心估算")
@@ -1031,7 +1068,11 @@ if __name__ == '__main__':
     parser.add_argument("--selfplay-queue-timeout", type=float, default=30.0, help="主线程取产数超时秒数")
     args = parser.parse_args()
 
-    pipeline = TrainPipeline()
+    pipeline = TrainPipeline(
+        board_size=args.board_size,
+        n_in_row=args.n_in_row,
+        fresh_start=args.fresh_start,
+    )
     if args.n_playout is not None:
         pipeline.n_playout = int(args.n_playout)
     pipeline.selfplay_backend = args.selfplay_backend
