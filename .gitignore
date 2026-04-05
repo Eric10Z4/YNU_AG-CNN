@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 models/*.pth
 runs/
+gat_cpp/build/
+*.pyd
