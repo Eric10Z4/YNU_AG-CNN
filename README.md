@@ -1,4 +1,4 @@
-# AlphaZero Gomoku 工程化改造报告
+# AlphaZero Gomoku 工程化扩展结合手搓CNN
 
 **项目名称**：AlphaZero 五子棋自博弈训练系统  
 **改造基础**：junxiaosong/AlphaZero_Gomoku（开源原型）  
