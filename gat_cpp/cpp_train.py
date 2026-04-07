@@ -75,7 +75,8 @@ def _import_mcts_cpp_module():
 class CppSelfPlayPlayer:
     """C++ 并行 MCTS 自对弈玩家，产出与 Python MCTSPlayer 同构的数据。"""
 
-    def __init__(self, board_size, n_in_row, c_puct=5, n_playout=400, num_threads=0, is_selfplay=True, seed=None):
+    def __init__(self, board_size, n_in_row, c_puct=5, n_playout=400, num_threads=0,
+                 is_selfplay=True, seed=None, eval_callback=None, eval_batch_size=8):
         self.board_size = board_size
         self.n_in_row = n_in_row
         self.c_puct = c_puct
@@ -94,6 +95,9 @@ class CppSelfPlayPlayer:
             seed=(int(seed) if seed is not None else 42),
             num_threads=int(num_threads),
         )
+        # Inject neural network callback for NN-guided MCTS
+        if eval_callback is not None:
+            self.ai.set_eval_callback(eval_callback, int(eval_batch_size))
 
     def set_player_ind(self, p):
         self.player = p
@@ -154,12 +158,12 @@ class TrainPipeline:
         self.game = Game(self.board)
 
         # 训练超参
-        self.learn_rate = 1.2e-3
+        self.learn_rate = 2.0e-3
         self.lr_multiplier = 1.0
         self.temp = 1.0
         self.seed = 42
         self.cpu_count = max(1, multiprocessing.cpu_count())
-        self.n_playout = 768
+        self.n_playout = 400
         self.c_puct = 5
         self.selfplay_backend = "cpp"
         self.eval_backend = "cpp"
@@ -168,22 +172,23 @@ class TrainPipeline:
         self.torch_cpu_threads = 1
         self.torch_interop_threads = 1
         self.batch_size = 512
-        self.buffer_size = 150000
+        self.buffer_size = 100000
         self.data_buffer = deque(maxlen=self.buffer_size)
         self.play_batch_size = 1
         self.selfplay_async_enabled = True
         self.selfplay_worker_count = 2
         self.selfplay_prefetch_games = 10
         self.selfplay_queue_timeout_sec = 30.0
-        self.epochs = 6
+        self.epochs = 5
         self.kl_targ = 0.02
-        self.check_freq = 150  # 强度优先：降低评估频率，留更多时间给高 playout 训练
-        self.game_batch_num = 12000
+        self.check_freq = 50
+        self.game_batch_num = 2000
         self.best_win_ratio = 0.0
-        self.pure_mcts_playout_num = 2400
+        self.pure_mcts_playout_num = 1000
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.opening_temp_moves = 6
         self.opening_temp = 1.0
+        self.midgame_temp = 0.35
         self.endgame_temp = 1e-3
         self.kl_explosion_threshold = self.kl_targ * 8
         self.high_kl_patience = 20
@@ -215,6 +220,7 @@ class TrainPipeline:
 
         # MCTS 玩家
         self.use_cpp_selfplay = self.selfplay_backend == "cpp"
+        self._net_lock = threading.Lock()  # protects NN forward/backward from concurrent access
         self.mcts_player = None
         self._build_selfplay_player(log_prefix="初始化")
         self.episode_len = 0
@@ -281,9 +287,46 @@ class TrainPipeline:
                 # 该设置在某些运行时只允许初始化前调用，忽略即可
                 pass
 
+    def _make_cpp_eval_callback(self):
+        """Create a batch evaluation callback for C++ MCTS neural network integration."""
+        net = self.policy_value_net
+        device = self.device
+        board_area = self.board_area
+        lock = self._net_lock
+
+        def batch_eval(state_np, batch_size, width, height):
+            # state_np: numpy array (batch_size, 4, width, height) from C++
+            state_tensor = torch.from_numpy(
+                np.ascontiguousarray(state_np)
+            ).float().to(device)
+
+            with lock:
+                net.eval_mode()
+                with torch.no_grad():
+                    act_probs, values = net.forward(state_tensor)
+
+            act_probs_np = act_probs.cpu().numpy()
+            values_np = values.cpu().numpy()
+
+            # Trim / pad policy dimension
+            if act_probs_np.shape[1] > board_area:
+                act_probs_np = act_probs_np[:, :board_area]
+            elif act_probs_np.shape[1] < board_area:
+                padded = np.zeros((batch_size, board_area), dtype=np.float32)
+                padded[:, :act_probs_np.shape[1]] = act_probs_np
+                act_probs_np = padded
+
+            results = []
+            for i in range(batch_size):
+                results.append((act_probs_np[i].tolist(), float(values_np[i][0])))
+            return results
+
+        return batch_eval
+
     def _build_selfplay_player(self, log_prefix=""):
         self.use_cpp_selfplay = self.selfplay_backend == "cpp"
         if self.use_cpp_selfplay:
+            eval_cb = self._make_cpp_eval_callback()
             self.mcts_player = CppSelfPlayPlayer(
                 board_size=self.board_width,
                 n_in_row=self.n_in_row,
@@ -292,10 +335,13 @@ class TrainPipeline:
                 num_threads=self.cpp_threads,
                 is_selfplay=True,
                 seed=self.seed,
+                eval_callback=eval_cb,
+                eval_batch_size=getattr(self, 'eval_batch_size', 8),
             )
             self._log(
-                f"{log_prefix}自对弈后端: C++ 并行 MCTS "
-                f"(threads={self.cpp_threads}, n_playout={self.n_playout}, cpu_count={self.cpu_count})"
+                f"{log_prefix}自对弈后端: C++ NN-MCTS "
+                f"(threads={self.cpp_threads}, n_playout={self.n_playout}, "
+                f"eval_batch_size={getattr(self, 'eval_batch_size', 8)}, cpu_count={self.cpu_count})"
             )
         else:
             self.mcts_player = MCTSPlayer(self.policy_value_fn, self.c_puct, self.n_playout, is_selfplay=1)
@@ -352,6 +398,7 @@ class TrainPipeline:
     def _make_selfplay_worker_components(self, worker_id):
         worker_board = Board(self.board_width, self.board_height, self.n_in_row)
         if self.use_cpp_selfplay:
+            eval_cb = self._make_cpp_eval_callback()
             worker_player = CppSelfPlayPlayer(
                 board_size=self.board_width,
                 n_in_row=self.n_in_row,
@@ -360,6 +407,8 @@ class TrainPipeline:
                 num_threads=self.cpp_threads,
                 is_selfplay=True,
                 seed=self.seed + 10007 * (worker_id + 1),
+                eval_callback=eval_cb,
+                eval_batch_size=getattr(self, 'eval_batch_size', 8),
             )
             return worker_board, worker_player, True
 
@@ -506,11 +555,19 @@ class TrainPipeline:
 
         mcts_cpp = _import_mcts_cpp_module()
         self.eval_cpp_board = mcts_cpp.Board(self.board_width, self.board_height, self.n_in_row)
+
+        # Current player: uses neural network for evaluation
         self.eval_cpp_current_player = mcts_cpp.AlphaZeroPlayer(
             c_puct=int(self.c_puct),
             n_playout=int(self.n_playout),
             num_threads=int(self.cpp_threads),
         )
+        eval_cb = self._make_cpp_eval_callback()
+        self.eval_cpp_current_player.set_eval_callback(
+            eval_cb, getattr(self, 'eval_batch_size', 8)
+        )
+
+        # Pure MCTS opponent: NO neural network (pure rollout baseline)
         self.eval_cpp_pure_player = mcts_cpp.AlphaZeroPlayer(
             c_puct=5,
             n_playout=int(self.pure_mcts_playout_num),
@@ -682,68 +739,72 @@ class TrainPipeline:
                 mcts_probs_batch = torch.tensor(np.array([d[1] for d in mini_batch]), dtype=torch.float32, device=self.device)
                 winner_batch = torch.tensor(np.array([d[2] for d in mini_batch]), dtype=torch.float32, device=self.device).unsqueeze(1)
 
-                self.policy_value_net.train_mode()
-                with torch.no_grad():
-                    old_probs, old_v = self.policy_value_net.forward(state_batch)
-                old_probs = old_probs.detach()
-                old_v = old_v.detach()
-                kl = 0.0
+                # ── 大锁：整个 forward/backward/KL 过程独占网络 ──
+                with self._net_lock:
+                    self.policy_value_net.train_mode()
+                    with torch.no_grad():
+                        old_probs, old_v = self.policy_value_net.forward(state_batch)
+                    old_probs = old_probs.detach()
+                    old_v = old_v.detach()
+                    kl = 0.0
 
-                for _ in range(self.epochs):
-                    self.policy_value_net.zero_grad()
-                    act_probs, value = self.policy_value_net.forward(state_batch)
+                    for _ in range(self.epochs):
+                        self.policy_value_net.zero_grad()
+                        act_probs, value = self.policy_value_net.forward(state_batch)
 
-                    # 动态对齐 MCTS 目标与网络输出维度
-                    if act_probs.shape[1] == mcts_probs_batch.shape[1] + 1:
-                        target_policy_full = torch.zeros_like(act_probs)
-                        target_policy_full[:, :-1] = mcts_probs_batch
-                        entropy_probs = act_probs[:, :-1]
-                    elif act_probs.shape[1] == mcts_probs_batch.shape[1]:
-                        target_policy_full = mcts_probs_batch
-                        entropy_probs = act_probs
-                    else:
-                        raise FloatingPointError(
-                            f"策略维度不匹配: net={act_probs.shape[1]}, target={mcts_probs_batch.shape[1]}"
+                        # 动态对齐 MCTS 目标与网络输出维度
+                        if act_probs.shape[1] == mcts_probs_batch.shape[1] + 1:
+                            target_policy_full = torch.zeros_like(act_probs)
+                            target_policy_full[:, :-1] = mcts_probs_batch
+                            entropy_probs = act_probs[:, :-1]
+                        elif act_probs.shape[1] == mcts_probs_batch.shape[1]:
+                            target_policy_full = mcts_probs_batch
+                            entropy_probs = act_probs
+                        else:
+                            raise FloatingPointError(
+                                f"策略维度不匹配: net={act_probs.shape[1]}, target={mcts_probs_batch.shape[1]}"
+                            )
+
+                        # 手算 Loss 和 梯度（与网络输出维度对齐）
+                        total_loss, loss_v, loss_p, grad_v, grad_p = combined_loss(
+                            act_probs, value, target_policy_full, winner_batch
                         )
 
-                    # 手算 Loss 和 梯度（与网络输出维度对齐）
-                    total_loss, loss_v, loss_p, grad_v, grad_p = combined_loss(
-                        act_probs, value, target_policy_full, winner_batch
-                    )
+                        if not torch.isfinite(total_loss):
+                            raise FloatingPointError("Loss 出现 NaN/Inf")
 
-                    if not torch.isfinite(total_loss):
-                        raise FloatingPointError("Loss 出现 NaN/Inf")
+                        policy_entropy = torch.mean(
+                            -torch.sum(entropy_probs * torch.log(entropy_probs + 1e-10), dim=1)
+                        )
 
-                    policy_entropy = torch.mean(
-                        -torch.sum(entropy_probs * torch.log(entropy_probs + 1e-10), dim=1)
-                    )
+                        # 手动反向传播与优化
+                        self.policy_value_net.backward(grad_p, grad_v)
+                        grad_norm = self._compute_grad_norm()
+                        if not np.isfinite(grad_norm):
+                            raise FloatingPointError("grad_norm 出现 NaN/Inf")
+                        self.optimizer.step()
 
-                    # 手动反向传播与优化
-                    self.policy_value_net.backward(grad_p, grad_v)
-                    grad_norm = self._compute_grad_norm()
-                    if not np.isfinite(grad_norm):
-                        raise FloatingPointError("grad_norm 出现 NaN/Inf")
-                    self.optimizer.step()
+                        with torch.no_grad():
+                            new_probs, _ = self.policy_value_net.forward(state_batch)
+                            kl = torch.mean(
+                                torch.sum(
+                                    old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10)),
+                                    dim=1
+                                )
+                            ).item()
 
-                    with torch.no_grad():
-                        new_probs, _ = self.policy_value_net.forward(state_batch)
-                        kl = torch.mean(
-                            torch.sum(
-                                old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10)),
-                                dim=1
-                            )
-                        ).item()
+                        if not np.isfinite(kl) or kl > self.kl_explosion_threshold:
+                            raise FloatingPointError(f"KL 爆炸: {kl:.5f}")
 
-                    if not np.isfinite(kl) or kl > self.kl_explosion_threshold:
-                        raise FloatingPointError(f"KL 爆炸: {kl:.5f}")
+                        if kl > self.kl_targ * 4:
+                            break
+                # ── 大锁结束 ──
 
-                    if kl > self.kl_targ * 4:
-                        break
-
-                if kl > self.kl_targ * 2 and self.lr_multiplier > 0.1:
-                    self.lr_multiplier /= 1.5
-                elif kl < self.kl_targ / 2 and self.lr_multiplier < 10:
-                    self.lr_multiplier *= 1.5
+                if kl > self.kl_targ * 1.8 and self.lr_multiplier > 0.2:
+                    self.lr_multiplier /= 1.25
+                elif kl < self.kl_targ * 0.7 and self.lr_multiplier < 1.5:
+                    self.lr_multiplier *= 1.1
+                self.lr_multiplier = float(np.clip(self.lr_multiplier, 0.2, 1.5))
                 self.optimizer.lr = self.learn_rate * self.lr_multiplier
 
                 explained_var_old = 1 - torch.var(winner_batch - old_v) / (torch.var(winner_batch) + 1e-10)
@@ -957,7 +1018,7 @@ class TrainPipeline:
 
         self.best_win_ratio = checkpoint.get("best_win_ratio", self.best_win_ratio)
         self.pure_mcts_playout_num = checkpoint.get("pure_mcts_playout_num", self.pure_mcts_playout_num)
-        self.lr_multiplier = checkpoint.get("lr_multiplier", self.lr_multiplier)
+        self.lr_multiplier = float(np.clip(checkpoint.get("lr_multiplier", self.lr_multiplier), 0.2, 1.5))
         self.optimizer.lr = self.learn_rate * self.lr_multiplier
         self.train_step = checkpoint.get("train_step", self.train_step)
         self.selfplay_step = checkpoint.get("selfplay_step", self.selfplay_step)
@@ -1004,11 +1065,13 @@ class TrainPipeline:
 
     def run(self):
         # 主循环
+        import itertools
         self._log("训练开始")
         if self.selfplay_async_enabled:
             self._start_selfplay_worker()
         try:
-            for i in range(self.game_batch_num):
+            iterator = range(self.game_batch_num) if self.game_batch_num > 0 else itertools.count()
+            for i in iterator:
                 self.collect_selfplay_data(self.play_batch_size)
                 self._log(f"Batch {i+1}: 游戏步数 {self.episode_len}, Buffer容量 {len(self.data_buffer)}")
 
@@ -1066,6 +1129,8 @@ if __name__ == '__main__':
     parser.add_argument("--selfplay-workers", type=int, default=2, help="后台产数 worker 数量")
     parser.add_argument("--selfplay-prefetch-games", type=int, default=6, help="后台产数队列容量（局数）")
     parser.add_argument("--selfplay-queue-timeout", type=float, default=30.0, help="主线程取产数超时秒数")
+    parser.add_argument("--game-batch-num", type=int, default=None, help="训练总轮数，0 表示无限循环")
+    parser.add_argument("--eval-batch-size", type=int, default=8, help="C++ MCTS 神经网络批量推理大小")
     args = parser.parse_args()
 
     pipeline = TrainPipeline(
@@ -1088,6 +1153,9 @@ if __name__ == '__main__':
     pipeline.selfplay_worker_count = max(1, int(args.selfplay_workers))
     pipeline.selfplay_prefetch_games = max(2, int(args.selfplay_prefetch_games))
     pipeline.selfplay_queue_timeout_sec = max(1.0, float(args.selfplay_queue_timeout))
+    if args.game_batch_num is not None:
+        pipeline.game_batch_num = int(args.game_batch_num)
+    pipeline.eval_batch_size = max(1, int(args.eval_batch_size))
 
     pipeline._apply_torch_thread_settings()
 

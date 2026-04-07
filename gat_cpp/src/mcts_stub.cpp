@@ -15,6 +15,13 @@
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// Value scaling: neural net returns float in [-1,1].  We store value_sum as
+// atomic<int> so we multiply by kValueScale before accumulating.  Pure-rollout
+// values {-1,0,1} are scaled the same way for consistency.
+// ---------------------------------------------------------------------------
+static constexpr int kValueScale = 10000;
+
 uint64_t splitmix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30U)) * 0xbf58476d1ce4e5b9ULL;
@@ -27,6 +34,7 @@ struct RootSnapshot {
     int height = 0;
     int n_in_row = 0;
     int current_player = 1;
+    int last_move = -1;
     std::vector<uint8_t> cells;
     std::vector<int> availables;
     std::vector<int> pos;
@@ -70,6 +78,10 @@ struct RolloutTask {
     float c_puct = 5.0F;
     std::atomic<int> next_sim{0};
 };
+
+// ---------------------------------------------------------------------------
+// Board helpers
+// ---------------------------------------------------------------------------
 
 bool has_a_winner_fast(const RolloutState& st, int move, int player) {
     if (move < 0 || player <= 0) {
@@ -135,6 +147,7 @@ RootSnapshot build_root_snapshot(const Board& board) {
     root.height = board.height();
     root.n_in_row = board.n_in_row();
     root.current_player = board.current_player();
+    root.last_move = board.last_move();
 
     const int board_size = root.width * root.height;
     root.cells.assign(static_cast<size_t>(board_size), 0U);
@@ -159,7 +172,7 @@ RolloutState make_rollout_state(const RootSnapshot& root) {
     st.height = root.height;
     st.n_in_row = root.n_in_row;
     st.current_player = root.current_player;
-    st.last_move = -1;
+    st.last_move = root.last_move;
     st.cells = root.cells;
     st.availables = root.availables;
     st.pos = root.pos;
@@ -180,6 +193,10 @@ bool evaluate_terminal_for_current_player(const RolloutState& st, int* value) {
     }
     return false;
 }
+
+// ---------------------------------------------------------------------------
+// Pure-rollout helpers (used when NO neural network callback is set)
+// ---------------------------------------------------------------------------
 
 int rollout_random_from_state(RolloutState st, std::mt19937& rng) {
     const int start_player = st.current_player;
@@ -248,7 +265,9 @@ void simulate_one(const RootSnapshot& root, Node* root_node, float c_puct, std::
             const int cv = child->visits.load(std::memory_order_relaxed);
             const int cs = child->value_sum.load(std::memory_order_relaxed);
             const int vl = child->virtual_loss.load(std::memory_order_relaxed);
-            const double q = (cv > 0) ? (static_cast<double>(cs) / static_cast<double>(cv)) : 0.0;
+            const double q = (cv > 0)
+                ? (-static_cast<double>(cs) / (static_cast<double>(cv) * kValueScale))
+                : 0.0;
             const double u = static_cast<double>(c_puct) * static_cast<double>(child->prior) * sqrt_parent /
                              static_cast<double>(1 + cv);
             const double score = q + u - static_cast<double>(vl);
@@ -275,7 +294,8 @@ void simulate_one(const RootSnapshot& root, Node* root_node, float c_puct, std::
         n->virtual_loss.fetch_sub(1, std::memory_order_relaxed);
     }
 
-    int v = leaf_value;
+    // Backup with VALUE_SCALE
+    int v = leaf_value * kValueScale;
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
         (*it)->visits.fetch_add(1, std::memory_order_relaxed);
         (*it)->value_sum.fetch_add(v, std::memory_order_relaxed);
@@ -283,7 +303,131 @@ void simulate_one(const RootSnapshot& root, Node* root_node, float c_puct, std::
     }
 }
 
+// ---------------------------------------------------------------------------
+// Neural-network batch search helpers
+// ---------------------------------------------------------------------------
+
+/// Information about one tree traversal that stopped at a leaf.
+struct LeafInfo {
+    std::vector<Node*> path;
+    std::vector<Node*> vl_nodes;   // nodes with virtual loss applied
+    RolloutState state;
+    Node* leaf_node = nullptr;
+    bool is_terminal = false;
+    int terminal_value = 0;
+};
+
+/// Build 4-channel state matching Python Board.current_state() layout.
+/// Channels: 0=current player stones, 1=opponent stones, 2=last move, 3=color.
+/// Output: 4 * board_size floats written to `out`.
+void build_state_channels(const RolloutState& st, float* out) {
+    const int board_size = st.width * st.height;
+    std::fill(out, out + 4 * board_size, 0.0F);
+
+    int total_stones = 0;
+    const auto cur = static_cast<uint8_t>(st.current_player);
+    for (int i = 0; i < board_size; ++i) {
+        if (st.cells[static_cast<size_t>(i)] == cur) {
+            out[i] = 1.0F;                        // channel 0
+            ++total_stones;
+        } else if (st.cells[static_cast<size_t>(i)] != 0U) {
+            out[board_size + i] = 1.0F;            // channel 1
+            ++total_stones;
+        }
+    }
+
+    if (st.last_move >= 0 && st.last_move < board_size) {
+        out[2 * board_size + st.last_move] = 1.0F; // channel 2
+    }
+
+    if (total_stones % 2 == 0) {                    // channel 3
+        std::fill(out + 3 * board_size, out + 4 * board_size, 1.0F);
+    }
+}
+
+/// Traverse the tree from root to a leaf (unexpanded or terminal node).
+/// Applies virtual losses along the path for diversity in batch collection.
+LeafInfo traverse_to_leaf(const RootSnapshot& root, Node* root_node, float c_puct) {
+    LeafInfo info;
+    RolloutState st = make_rollout_state(root);
+    Node* node = root_node;
+    info.path.push_back(node);
+
+    while (true) {
+        int term_val = 0;
+        if (evaluate_terminal_for_current_player(st, &term_val)) {
+            info.state = std::move(st);
+            info.leaf_node = node;
+            info.is_terminal = true;
+            info.terminal_value = term_val;
+            return info;
+        }
+
+        if (!node->expanded.load(std::memory_order_acquire)) {
+            info.state = std::move(st);
+            info.leaf_node = node;
+            return info;
+        }
+
+        // UCB child selection (same formula as simulate_one)
+        Node* best_child = nullptr;
+        int best_move = -1;
+        double best_score = -std::numeric_limits<double>::infinity();
+        const int pv = std::max(1, node->visits.load(std::memory_order_relaxed));
+        const double sqrt_pv = std::sqrt(static_cast<double>(pv));
+
+        for (const auto& edge : node->children) {
+            Node* child = edge.child.get();
+            const int cv = child->visits.load(std::memory_order_relaxed);
+            const int cs = child->value_sum.load(std::memory_order_relaxed);
+            const int vl = child->virtual_loss.load(std::memory_order_relaxed);
+            const double q = (cv > 0)
+                ? (-static_cast<double>(cs) / (static_cast<double>(cv) * kValueScale))
+                : 0.0;
+            const double u = static_cast<double>(c_puct) * static_cast<double>(child->prior)
+                             * sqrt_pv / static_cast<double>(1 + cv);
+            const double score = q + u - static_cast<double>(vl);
+            if (score > best_score) {
+                best_score = score;
+                best_move = edge.move;
+                best_child = child;
+            }
+        }
+
+        if (best_child == nullptr || best_move < 0) {
+            info.state = std::move(st);
+            info.leaf_node = node;
+            return info;
+        }
+
+        best_child->virtual_loss.fetch_add(1, std::memory_order_relaxed);
+        info.vl_nodes.push_back(best_child);
+        do_move_fast(st, best_move);
+        node = best_child;
+        info.path.push_back(node);
+    }
+}
+
+/// Backup a value along a path (removing virtual losses).
+void backup_leaf(LeafInfo& info, int scaled_value) {
+    // Remove virtual losses
+    for (Node* n : info.vl_nodes) {
+        n->virtual_loss.fetch_sub(1, std::memory_order_relaxed);
+    }
+    // Backup value
+    int v = scaled_value;
+    for (auto it = info.path.rbegin(); it != info.path.rend(); ++it) {
+        (*it)->visits.fetch_add(1, std::memory_order_relaxed);
+        (*it)->value_sum.fetch_add(v, std::memory_order_relaxed);
+        v = -v;
+    }
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// AlphaZeroPlayer implementation
+// ---------------------------------------------------------------------------
 
 struct AlphaZeroPlayer::ThreadPoolState {
     int worker_count = 0;
@@ -302,7 +446,8 @@ struct AlphaZeroPlayer::SearchTreeState {
 };
 
 AlphaZeroPlayer::AlphaZeroPlayer(int c_puct, int n_playout, int seed, int num_threads)
-    : c_puct_(c_puct), n_playout_(n_playout), num_threads_(num_threads), player_(1), rng_(seed) {
+    : c_puct_(c_puct), n_playout_(n_playout), num_threads_(num_threads), player_(1),
+      eval_batch_size_(8), rng_(seed) {
     if (n_playout_ <= 0) {
         throw std::runtime_error("n_playout must be > 0");
     }
@@ -331,6 +476,12 @@ void AlphaZeroPlayer::set_num_threads(int num_threads) {
     if (num_threads_ <= 1) {
         shutdown_thread_pool();
     }
+}
+
+void AlphaZeroPlayer::set_eval_callback(BatchEvalFn cb, int batch_size) {
+    std::lock_guard<std::mutex> guard(action_mutex_);
+    eval_callback_ = std::move(cb);
+    eval_batch_size_ = std::max(1, batch_size);
 }
 
 void AlphaZeroPlayer::reset_player() {
@@ -454,6 +605,98 @@ void AlphaZeroPlayer::worker_loop(int thread_id) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Neural-network batch MCTS search
+// ---------------------------------------------------------------------------
+// Single-threaded: collect batch_size leaves, evaluate in one NN call, expand & backup.
+// This is called from get_action / get_move_probs when eval_callback_ is set.
+
+static void run_nn_batch_search(
+    const RootSnapshot& root,
+    Node* root_node,
+    int total_playouts,
+    int batch_size,
+    float c_puct,
+    const BatchEvalFn& callback)
+{
+    const int board_size = root.width * root.height;
+    int remaining = total_playouts;
+
+    while (remaining > 0) {
+        const int cur_batch = std::min(batch_size, remaining);
+
+        // Phase 1: Traverse tree to collect leaves
+        std::vector<LeafInfo> nn_leaves;
+        nn_leaves.reserve(static_cast<size_t>(cur_batch));
+
+        for (int i = 0; i < cur_batch; ++i) {
+            LeafInfo info = traverse_to_leaf(root, root_node, c_puct);
+            if (info.is_terminal) {
+                // Terminal nodes: backup immediately, no NN needed
+                backup_leaf(info, info.terminal_value * kValueScale);
+            } else {
+                nn_leaves.push_back(std::move(info));
+            }
+        }
+
+        // Phase 2: Batch evaluate non-terminal leaves
+        if (!nn_leaves.empty()) {
+            const int n = static_cast<int>(nn_leaves.size());
+
+            // Build batch state tensor (n * 4 * board_size floats)
+            std::vector<float> state_batch(static_cast<size_t>(n) * 4 * static_cast<size_t>(board_size), 0.0F);
+            for (int i = 0; i < n; ++i) {
+                build_state_channels(nn_leaves[static_cast<size_t>(i)].state,
+                                     &state_batch[static_cast<size_t>(i) * 4 * static_cast<size_t>(board_size)]);
+            }
+
+            // Call neural network (single batch call)
+            std::vector<EvalResult> results = callback(state_batch, n, root.width, root.height);
+
+            // Phase 3: Expand leaves with NN policy and backup NN value
+            for (int i = 0; i < n; ++i) {
+                LeafInfo& leaf = nn_leaves[static_cast<size_t>(i)];
+                Node* node = leaf.leaf_node;
+
+                if (i < static_cast<int>(results.size())) {
+                    const auto& policy = results[static_cast<size_t>(i)].policy;
+                    const float value = results[static_cast<size_t>(i)].value;
+
+                    // Expand node with NN policy priors
+                    if (!node->expanded.load(std::memory_order_acquire)) {
+                        node->children.reserve(leaf.state.availables.size());
+                        for (int mv : leaf.state.availables) {
+                            float prior = (mv >= 0 && mv < static_cast<int>(policy.size()))
+                                ? policy[static_cast<size_t>(mv)]
+                                : 1e-8F;
+                            prior = std::max(prior, 1e-8F);
+                            Node::Edge e;
+                            e.move = mv;
+                            e.child = std::make_unique<Node>(prior);
+                            node->children.push_back(std::move(e));
+                        }
+                        node->expanded.store(true, std::memory_order_release);
+                    }
+
+                    // Backup NN value (scaled to int)
+                    int sv = static_cast<int>(std::round(value * kValueScale));
+                    sv = std::max(-kValueScale, std::min(kValueScale, sv));
+                    backup_leaf(leaf, sv);
+                } else {
+                    // Fallback: callback returned fewer results than expected
+                    backup_leaf(leaf, 0);
+                }
+            }
+        }
+
+        remaining -= cur_batch;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_action / get_move_probs (support both NN and rollout modes)
+// ---------------------------------------------------------------------------
+
 int AlphaZeroPlayer::get_action(const Board& board) {
     std::lock_guard<std::mutex> guard(action_mutex_);
 
@@ -462,7 +705,6 @@ int AlphaZeroPlayer::get_action(const Board& board) {
         return -1;
     }
 
-    const int threads = std::min(resolve_thread_count(), n_playout_);
     const int total_playouts = n_playout_;
     const RootSnapshot root = build_root_snapshot(board);
 
@@ -474,44 +716,45 @@ int AlphaZeroPlayer::get_action(const Board& board) {
     }
     Node* root_node = tree_state_->root.get();
 
-    if (threads == 1) {
-        std::mt19937 thread_rng(rng_());
-        for (int sim = 0; sim < total_playouts; ++sim) {
-            simulate_one(root, root_node, static_cast<float>(c_puct_), thread_rng);
-        }
+    if (eval_callback_) {
+        // ---- Neural network batch search (single-threaded) ----
+        run_nn_batch_search(root, root_node, total_playouts, eval_batch_size_,
+                            static_cast<float>(c_puct_), eval_callback_);
     } else {
-        ensure_thread_pool(threads);
-
-        // Generate per-thread seeds on the caller thread to avoid shared RNG races.
-        const uint64_t seed_base = static_cast<uint64_t>(rng_());
-        std::vector<uint64_t> thread_seeds;
-        thread_seeds.reserve(threads);
-        for (int t = 0; t < threads; ++t) {
-            thread_seeds.push_back(splitmix64(seed_base + static_cast<uint64_t>(t + 1)));
-        }
-
-        if (!pool_state_) {
-            throw std::runtime_error("thread pool is not initialized");
-        }
-
-        auto root_ptr = std::make_shared<RootSnapshot>(root);
-
-        {
-            std::unique_lock<std::mutex> lock(pool_state_->mu);
-            pool_state_->task.root = root_ptr;
-            pool_state_->task.root_node = root_node;
-            pool_state_->task.thread_seeds = std::move(thread_seeds);
-            pool_state_->task.total_playouts = total_playouts;
-            pool_state_->task.c_puct = static_cast<float>(c_puct_);
-            pool_state_->task.chunk_size = std::max(16, total_playouts / (threads * 32));
-            pool_state_->task.next_sim.store(0);
-
-            pool_state_->pending = threads;
-            pool_state_->generation += 1;
-            pool_state_->cv.notify_all();
-
-            pool_state_->cv.wait(lock, [&]() { return pool_state_->pending == 0; });
-            pool_state_->task.root_node = nullptr;
+        // ---- Pure rollout search (potentially multi-threaded) ----
+        const int threads = std::min(resolve_thread_count(), n_playout_);
+        if (threads == 1) {
+            std::mt19937 thread_rng(rng_());
+            for (int sim = 0; sim < total_playouts; ++sim) {
+                simulate_one(root, root_node, static_cast<float>(c_puct_), thread_rng);
+            }
+        } else {
+            ensure_thread_pool(threads);
+            const uint64_t seed_base = static_cast<uint64_t>(rng_());
+            std::vector<uint64_t> thread_seeds;
+            thread_seeds.reserve(threads);
+            for (int t = 0; t < threads; ++t) {
+                thread_seeds.push_back(splitmix64(seed_base + static_cast<uint64_t>(t + 1)));
+            }
+            if (!pool_state_) {
+                throw std::runtime_error("thread pool is not initialized");
+            }
+            auto root_ptr = std::make_shared<RootSnapshot>(root);
+            {
+                std::unique_lock<std::mutex> lock(pool_state_->mu);
+                pool_state_->task.root = root_ptr;
+                pool_state_->task.root_node = root_node;
+                pool_state_->task.thread_seeds = std::move(thread_seeds);
+                pool_state_->task.total_playouts = total_playouts;
+                pool_state_->task.c_puct = static_cast<float>(c_puct_);
+                pool_state_->task.chunk_size = std::max(16, total_playouts / (threads * 32));
+                pool_state_->task.next_sim.store(0);
+                pool_state_->pending = threads;
+                pool_state_->generation += 1;
+                pool_state_->cv.notify_all();
+                pool_state_->cv.wait(lock, [&]() { return pool_state_->pending == 0; });
+                pool_state_->task.root_node = nullptr;
+            }
         }
     }
 
@@ -531,7 +774,9 @@ int AlphaZeroPlayer::get_action(const Board& board) {
         }
         const int cv = edge.child->visits.load(std::memory_order_relaxed);
         const int cs = edge.child->value_sum.load(std::memory_order_relaxed);
-        const double q = (cv > 0) ? (static_cast<double>(cs) / static_cast<double>(cv)) : -1e9;
+        const double q = (cv > 0)
+            ? (static_cast<double>(cs) / (static_cast<double>(cv) * kValueScale))
+            : -1e9;
         if (cv > best_visits || (cv == best_visits && q > best_q)) {
             best_visits = cv;
             best_q = q;
@@ -552,7 +797,6 @@ std::vector<float> AlphaZeroPlayer::get_move_probs(const Board& board, float tem
         return full_probs;
     }
 
-    const int threads = std::min(resolve_thread_count(), n_playout_);
     const int total_playouts = n_playout_;
     const RootSnapshot root = build_root_snapshot(board);
 
@@ -564,42 +808,45 @@ std::vector<float> AlphaZeroPlayer::get_move_probs(const Board& board, float tem
     }
     Node* root_node = tree_state_->root.get();
 
-    if (threads == 1) {
-        std::mt19937 thread_rng(rng_());
-        for (int sim = 0; sim < total_playouts; ++sim) {
-            simulate_one(root, root_node, static_cast<float>(c_puct_), thread_rng);
-        }
+    if (eval_callback_) {
+        // ---- Neural network batch search ----
+        run_nn_batch_search(root, root_node, total_playouts, eval_batch_size_,
+                            static_cast<float>(c_puct_), eval_callback_);
     } else {
-        ensure_thread_pool(threads);
-
-        const uint64_t seed_base = static_cast<uint64_t>(rng_());
-        std::vector<uint64_t> thread_seeds;
-        thread_seeds.reserve(threads);
-        for (int t = 0; t < threads; ++t) {
-            thread_seeds.push_back(splitmix64(seed_base + static_cast<uint64_t>(t + 1)));
-        }
-
-        if (!pool_state_) {
-            throw std::runtime_error("thread pool is not initialized");
-        }
-
-        auto root_ptr = std::make_shared<RootSnapshot>(root);
-        {
-            std::unique_lock<std::mutex> lock(pool_state_->mu);
-            pool_state_->task.root = root_ptr;
-            pool_state_->task.root_node = root_node;
-            pool_state_->task.thread_seeds = std::move(thread_seeds);
-            pool_state_->task.total_playouts = total_playouts;
-            pool_state_->task.c_puct = static_cast<float>(c_puct_);
-            pool_state_->task.chunk_size = std::max(16, total_playouts / (threads * 32));
-            pool_state_->task.next_sim.store(0);
-
-            pool_state_->pending = threads;
-            pool_state_->generation += 1;
-            pool_state_->cv.notify_all();
-
-            pool_state_->cv.wait(lock, [&]() { return pool_state_->pending == 0; });
-            pool_state_->task.root_node = nullptr;
+        // ---- Pure rollout search ----
+        const int threads = std::min(resolve_thread_count(), n_playout_);
+        if (threads == 1) {
+            std::mt19937 thread_rng(rng_());
+            for (int sim = 0; sim < total_playouts; ++sim) {
+                simulate_one(root, root_node, static_cast<float>(c_puct_), thread_rng);
+            }
+        } else {
+            ensure_thread_pool(threads);
+            const uint64_t seed_base = static_cast<uint64_t>(rng_());
+            std::vector<uint64_t> thread_seeds;
+            thread_seeds.reserve(threads);
+            for (int t = 0; t < threads; ++t) {
+                thread_seeds.push_back(splitmix64(seed_base + static_cast<uint64_t>(t + 1)));
+            }
+            if (!pool_state_) {
+                throw std::runtime_error("thread pool is not initialized");
+            }
+            auto root_ptr = std::make_shared<RootSnapshot>(root);
+            {
+                std::unique_lock<std::mutex> lock(pool_state_->mu);
+                pool_state_->task.root = root_ptr;
+                pool_state_->task.root_node = root_node;
+                pool_state_->task.thread_seeds = std::move(thread_seeds);
+                pool_state_->task.total_playouts = total_playouts;
+                pool_state_->task.c_puct = static_cast<float>(c_puct_);
+                pool_state_->task.chunk_size = std::max(16, total_playouts / (threads * 32));
+                pool_state_->task.next_sim.store(0);
+                pool_state_->pending = threads;
+                pool_state_->generation += 1;
+                pool_state_->cv.notify_all();
+                pool_state_->cv.wait(lock, [&]() { return pool_state_->pending == 0; });
+                pool_state_->task.root_node = nullptr;
+            }
         }
     }
 
