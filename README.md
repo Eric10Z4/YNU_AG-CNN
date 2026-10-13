@@ -1,173 +1,71 @@
-# AlphaZero Gomoku 工程化扩展结合手搓CNN
+# YNU_AG-CNN：AlphaZero 五子棋实验
 
-**项目名称**：AlphaZero 五子棋自博弈训练系统  
-**改造基础**：junxiaosong/AlphaZero_Gomoku（开源原型）  
-**改造范围**：Python 运行时工程化 + C++ 高性能计算后端集成  
-**文档版本**：v2.0
+结合手写 CNN 前向 / 反向传播与蒙特卡洛树搜索的五子棋学习项目，包含 Python 训练流程和可选 C++ 搜索后端。原始思路与部分实现基于 [AlphaZero_Gomoku](https://github.com/junxiaosong/AlphaZero_Gomoku)，来源与授权边界见 [AUTHORIZATION.md](AUTHORIZATION.md)。
 
----
+项目用于学习和实验，训练效果取决于棋盘、模拟次数、随机种子、硬件和训练时长。当前仓库没有可据以复核旧胜率描述的完整模型与评估数据，因此不作性能或逐位复现保证。
 
-## 项目背景
+## 目录
 
-本项目以开源 AlphaZero Gomoku 算法原型为基础，执行了系统性的工业级工程改造。改造目标为：将算法验证级原型提升为具备高可用性、长期可复现训练能力与生产级容灾保障的完整训练闭环，并通过引入 C++ 高性能计算后端，突破 Python 运行时的并发性能瓶颈。
+| 目录 | 用途 |
+| --- | --- |
+| `core/` | 棋盘、搜索与底层算子 |
+| `pipeline/` | 手写策略价值网络、优化器、检查点验证 |
+| `gat/` | Python 训练和人机对弈入口 |
+| `gat_cpp/` | C++ 棋盘与搜索、Python 绑定及训练入口 |
+| `tests/` | 检查点完整性与真实梯度更新的回归检查 |
 
----
+## 安装
 
-## 算法基座概述：AlphaZero 强化学习原理
+建议使用 Python 3.12 独立环境。直接依赖固定为 NumPy 2.2.6、PyTorch 2.6.0、TensorBoard 2.19.0；传递依赖没有完整锁定。
 
-AlphaZero 属于**通用强化学习 (General Reinforcement Learning)** 范畴。其核心突破在于：完全摒弃对人类历史棋谱的依赖，通过**纯自我对弈 (Pure Self-Play)** 机制，从随机初始化状态 (Tabula Rasa) 出发，自主习得超越人类水平的棋局策略。系统由以下三个核心模块构成：
+```sh
+python -m venv .venv
+# Windows PowerShell：.venv\Scripts\Activate.ps1
+# Linux / macOS：source .venv/bin/activate
+python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+```
 
-### 模块 1：双头策略-价值网络 (Policy-Value Network)
+也可使用 `conda env create -f environment.yml`。上面使用 CPU 基线；需要 CUDA 时，根据本机环境安装对应 PyTorch 发行包并记录版本。GUI 额外安装 `requirements-gui.txt`；C++ 构建额外安装 `requirements-build.txt` 和 C++17 编译器。
 
-网络以棋局位图（己方落点 / 敌方落点 / 当前执子方等多维空间状态）为输入，经卷积或残差特征提取后，输出两个独立分支：
+## 快速验证
 
-- **策略输出 (Policy, P)**：输出当前盘面所有合法落子点的先验概率分布，作为 MCTS 树搜索的启发导向，引导计算资源向高概率分支集中。
-- **价值输出 (Value, V)**：输出当前盘面最终获胜概率的标量估计（取值范围 [-1, 1]），直接替代传统纯 MCTS 依赖随机走步推演至终局的极高成本评估过程（Rollout）。
+在仓库根目录执行：
 
-### 模块 2：神经网络引导的 MCTS 树搜索 (NN-Guided MCTS)
+```sh
+python -B -m unittest discover -s tests -v
+python core/test.py
+```
 
-区别于传统蒙特卡洛随机 Rollout 方式，MCTS 通过策略-价值网络进行高效启发式引导。每步决策执行以下四个阶段的标准模拟循环：
+下面用小棋盘和低模拟次数运行一局 Python 后端自博弈，验证入口可运行，不代表训练收敛：
 
-1. **Selection（节点选择）**：从根节点起，依据先验概率 $P$ 与 PUCT 置信区间算法（平衡节点访问次数与胜率估计），沿树结构寻找当前最优待扩展叶节点。
-2. **Expansion & Evaluation（扩展与评估）**：到达未知叶节点后，调用网络推理获取价值估计 $V$ 及后续分支先验概率 $P$，完成节点展开，不执行底层穷举回放。
-3. **Backup（价值反传）**：将网络返回的局面估计值 $V$，沿搜索路径逆向递推，逐层更新各父节点的行动价值 $Q$ 与访问计数 $N$。
-4. **Play（决策输出）**：模拟结束后，依据根节点各子节点访问计数 $N$，结合温控参数（Temperature）生成最终落子行动概率 $\pi$。
+```sh
+python gat_cpp/cpp_train.py --selfplay-backend python --eval-backend python --fresh-start --board-size 5 --n-in-row 4 --game-batch-num 1 --n-playout 8 --disable-selfplay-async --torch-cpu-threads 1
+```
 
-### 模块 3：自博弈训练闭环 (Self-Play Training Loop)
+完整参数见 `python gat_cpp/cpp_train.py --help`。默认 C++ 后端必须先构建；选择 Python 后端可以不安装 C++ 扩展。
 
-策略-价值网络与 MCTS 树搜索通过以下闭环机制协同迭代进化：
+## C++ 后端
 
-- **自博弈数据采集 (Self-Play)**：以当前参数化网络驱动自对弈，汇集每步三元组数据 `[State, MCTS 落子分布 π, 终局奖励 Z]`，写入经验回放池 (Replay Buffer)。
-- **网络参数更新 (Gradient Descent)**：从回放池抽样批次，以如下双目标复合损失进行梯度下降：策略头输出 $P$ 拟合 MCTS 落子分布 $\pi$（交叉熵损失），价值头输出 $V$ 拟合环境终局奖励 $Z$（均方误差损失）。
-- **能力自举正反馈**：MCTS 深度搜索产出高质量局势数据 → 高质量数据使网络估值与策略精度提升 → 精度更高的网络反向增强 MCTS 的剪枝效率与搜索深度，形成自我强化闭环。
+```sh
+python -m pip install -r requirements-build.txt
+cmake -S gat_cpp -B gat_cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build gat_cpp/build --config Release
+python gat_cpp/tools/run_parallel_smoke.py --playout 32 --threads 2
+```
 
----
+多 Python 环境下应向 CMake 显式指定当前环境的 `Python3_EXECUTABLE`，详见 [C++ 说明](gat_cpp/README.md)。自动检查在 Linux 上构建扩展并执行小规模搜索；长时间多线程训练和硬件性能需要另行测量。
 
-## Phase 0：神经网络底层算子手工实现（协作模块）
+## 模型保存与恢复
 
-> 本模块为团队协作成果，由负责底层算子实现的成员完成。
+检查点 v2 保存网络参数、BatchNorm 运行统计量、网络规格、棋盘规则、优化器与训练状态。恢复前检查完整参数和优化器张量，并核对回放数据的尺寸，避免不同棋盘的权重被部分混合加载。
 
-本项目在神经网络评估的最底层实现上，选择脱离 PyTorch / TensorFlow 等高层框架的自动求导机制，以纯数值手工方式实现了完整的前向与反向计算流，构成了项目的核心技术壁垒。
+新模型按 `models/<棋盘尺寸>_n<连珠数>/` 保存。原有模型文件保持原位；旧格式缺少 BatchNorm 统计量，无法可靠恢复完整预测状态，加载时会明确拒绝。保留旧实验前先备份，再安排重新训练或经过验证的数据校准迁移。
 
-- **手工数值算子实现 (Custom Numerical Ops)**：从头实现了二维卷积 (Conv2D)、批规范化 (Batch Normalization)、全连接层 (Linear) 以及非线性激活函数，不依赖任何高层算子库。
-- **手工梯度反传 (Manual Backpropagation)**：基于矩阵微积分原理，手动推导并实现了全网络级联层间的误差反向梯度传递机制，完全不依赖自动微分引擎。
-- **定制优化器与复合损失函数 (Optimizer & Loss)**：实现了适配 Actor-Critic 双头输出特性的自定义数值优化器，及交叉熵 / 均方误差混合损失函数。
+已有 `.model/.model2` 独立 legacy 推理路径保留；手写网络的新参数字典使用 v2 格式。只加载可信来源的检查点，模型读取包含 Python 序列化对象。
 
-该模块技术门槛高，但代码职责边界清晰，赋予了整套引擎在不依赖高层深度学习安装包的情况下完整运行的能力。
+配置快照在命令行覆盖与线程调优后更新。训练输出、模型、运行日志与本地配置已加入忽略规则，不提交个人路径、私有数据或服务凭据。
 
----
+## 授权
 
-## Phase 1：Python 运行时工程化改造
-
-### 1.1 状态机优化与内存安全
-
-- **局部射线胜负判定**：将每步落子后 O(N²) 的全盘扫描逻辑，重构为基于落子点向四个方向（横 / 纵 / 双斜）的 O(1) 局部射线检测算法，降低底层算子执行开销，满足高频自博弈吞吐需求。*( `core/board.py` → `has_a_winner`)*
-- **深拷贝状态隔离**：对核心局势对象引入强制深拷贝 (Deep Copy) 机制，隔离 MCTS 模拟推演 (Rollout) 对真实棋盘状态的非法写入，防止内存级状态污染。*( `core/mcts.py` / `core/mcts_alpha.py` → `copy.deepcopy(state)`)*
-
-### 1.2 MCTS 双核并发架构
-
-系统保留纯蒙特卡洛随机树作为长期基准对抗对手 (Baseline)，同时部署神经网络引导的 AlphaZero MCTS 作为主搜索引擎，两套引擎共存于同一环境套件中。
-
-- **神经网络先验引导**：以网络预测的策略密度 P 和价值估计 V 驱动树节点扩展优先级，大幅减少达到等效决策质量所需的模拟步数。*( `core/mcts_alpha.py` → `AlphaZeroMCTS` 回调接口)*
-- **非法动作掩码与树-盘一致性保护**：在动作采样层实现合法动作掩码 (Legal Move Masking)；对树内状态指针与物理盘面进行实时一致性巡检，发现脱节时触发自动重置。*( `core/mcts_alpha.py` → `available_moves` Mask 过滤)*
-- **根节点 Dirichlet 噪声注入**：在根节点强制叠加 Dirichlet 分布噪声，打破收敛后期自博弈中高频重复路径导致的探索塌陷。*( `core/mcts_alpha.py` → `get_move_probs` 的 `np.random.dirichlet`)*
-
-### 1.3 训练流水线工程化保障
-
-针对强化学习训练过程中易出现的算力浪费与不可控性能退化问题，对训练流水线实施以下系统级保障措施：
-
-- **检查点原子写入 (Atomic Checkpoint Save)**：采用 `torch.save` 写入临时文件后通过 `os.replace` 原子重命名的方式落盘模型，规避进程中断导致的 Checkpoint 文件损坏，保障断点续训能力。*( `pipeline/train.py` → `_save_model` / `_load_checkpoint`)*
-
-- **数值异常熔断与回滚 (NaN Protection & Rollback)**：在训练更新链路中引入数值监控机制，检测到 Loss 出现 NaN 或 KL 散度超出阈值时，立即丢弃当前失效批次，回滚至最近健康存档，并自动降低学习率后恢复训练。*( `pipeline/train.py` → `policy_update` 异常处理 + `core/losses.py` 浮点审核)*
-
-- **动态温控策略 (Dynamic Temperature Decay)**：按时间步分阶段划分探索模式：前置阶段保持高温以促进开局多样性；进入残局阶段后降至低温以增强利用性，提升中后期自博弈数据的有效样本价值。*( `pipeline/train.py` → `collect_selfplay_data` 的 `temp_threshold` 分界逻辑)*
-
-- **CLI 参数系统与超参快照 (CLI Args & Config Snapshot)**：全项目接入标准化 CLI 参数总线，支持服务器侧 Shell 脚本批处理调用。每次检查点存档同步序列化当前超参配置 (`train_config`)，结合固定全局随机种子，提供 100% 可复现的实验溯源能力。*( `pipeline/train.py` → 参数总线接口)*
-
-- **TensorBoard 深度监控接入 (Metrics Monitoring)**：将训练统计量实时写入 TensorBoard 数据流，重点监控：`grad_norm`（梯度范数，用于检测手写网络梯度爆炸）与 `policy_entropy`（策略熵，用于检测策略退化为均匀随机分布的异常状态）。*( `pipeline/train.py` → `SummaryWriter` 打点接口)*
-
-- **任意棋盘尺寸泛化兼容 (Board Size Compatibility)**：网络架构与训练逻辑解耦于固定棋盘尺寸，支持以配置参数方式平滑切换 8×8 / 11×11 / 15×15 (n×n) 等不同规格。Checkpoint 加载前引入张量维度兼容性校验，防止跨尺寸加载导致的维度不匹配崩溃。
-
-- **软早停与性能回滚保护 (Soft Early Stopping)**：持续监控评估阶段的模型胜率与 KL 散度变化趋势。当出现连续评估失败或 KL 散度不可逆性超限时，触发软早停：自动回滚至历史最高胜率检查点 (`best_policy.pth`)，降低学习率后继续训练，或安全退出训练进程，防止灾难性遗忘导致的资源浪费。*( `pipeline/train.py` → `policy_evaluate` 回滚逻辑)*
-
-- **基于胜率的自适应学习率调整 (Win-rate Adaptive LR)**：评估阶段胜率持续下滑时，系统在触发软早停之前优先执行学习率阶梯衰减（默认衰减因子 0.5），在不中断训练的前提下尝试使模型跳出当前学习平台期，仅在多次降率后仍无改善时方触发回滚或退出。*( `pipeline/train.py` → `policy_evaluate` 学习率调整逻辑)*
-
-- **评估结果持久化导出 (Evaluation CSV Export)**：每轮评估完成后，将 `[训练轮次, 基准模拟量, 胜率, 耗时]` 等关键指标追加写入 CSV 文件，为后期模型性能曲线分析与实验结论验证提供结构化数据源。*( `pipeline/train.py` → `eval_history.csv` 追写模块)*
-
----
-
-## Phase 2：C++ 高性能计算后端集成
-
-### 2.1 性能瓶颈背景
-
-Python 运行时在 AlphaZero MCTS 密集推演场景下存在以下两类根本性性能限制：
-
-1. **高频对象分配开销**：MCTS 树每次节点扩展均需构建大量 Python 原生 `dict` 查找表与对象引用，产生高频内存分配与 GC 停顿，导致显著吞吐损耗。
-2. **GIL 并发锁限制**：Python 全局解释器锁 (GIL) 使 MCTS 密集计算阶段实际并发上限为单核，大规模多核物理资源（如 Xeon 128 核）无法有效利用，CPU 利用率趋近于零。
-
-上述限制导致纯 Python 单核 MCTS 吞吐量低于 10 步/秒，单局耗时达分钟级，无法满足 AlphaZero 对数万至数十万量级自博弈数据的规模化训练需求。
-
-### 2.2 C++ 后端重构方案
-
-采用 `pybind11` 框架，以 C++11 标准在 `gat_cpp/` 模块中对棋盘环境模拟与 MCTS 内存树结构进行完整重写。整体架构遵循现代强化学习系统的最优工程范式：**Python 层负责高维张量求导与训练调度，C++ 层负责高频逻辑仿真与并行状态推演。**
-
-#### 2.2.1 内存连续化状态机
-
-以 C++ 底层连续数组结构与位运算算子替代全部 Python `dict` 映射，将胜利条件扫描与落子校验下沉为指针偏移操作，单次合法动作查询复杂度降至 O(1)。*( `gat_cpp/src/board.cpp`)*
-
-#### 2.2.2 GIL 释放的真实多线程并行
-
-在 C++ pybind11 接口层声明 `py::call_guard<py::gil_scoped_release>()`，在 C++ 执行期间主动释放 Python GIL，使多个后台自对弈 Worker 可真正并发运行，充分利用宿主机全部物理核心算力。*( `gat_cpp/src/bindings.cpp`)*
-
-#### 2.2.3 批量神经网络推理 (Batch Evaluation)
-
-传统交互模式下，C++ 每扩展一个未知叶节点即需中断并跨语言调用 Python 侧网络推理，高频细粒度跨语言通信产生极高延迟开销。本方案实施以下优化：
-
-- **延迟批量化 (Batch Accumulation)**：修改 MCTS 遍历逻辑，当遇到待扩展未知节点时，不立即触发跨语言调用，而是将其挂起入队，继续并行扫描其他分支，直至攒够单批阈值（如 `batch_size=128`）。*( `gat_cpp/src/mcts_stub.cpp` → `run_nn_batch_search`)*
-- **单次批量过桥**：队列满足阈值后，触发一次 `EvalCallback`，将所有待扩展节点打包为 NumPy 张量，统一交由 Python GPU 执行批量矩阵推理。
-- **定点数值原子映射 (kValueScale)**：将浮点胜率值乘以常量因子 `kValueScale = 10000` 转为整数，以支持 C++ `atomic<int>` 无锁原子累加操作，消除多线程值域类型不匹配问题。*( `gat_cpp/src/mcts_stub.hpp`)*
-
-#### 2.2.4 全局训练锁保护 (_net_lock)
-
-引入 C++ 并发后，多个后台 Worker 会频繁并发调用 Python 侧 `policy_value_net.forward`，与前台主线程的 `backward` + `optimizer.step` 更新链路形成资源竞争，导致张量状态不一致并引发运行时段错误（core dump）。
-
-解决方案：在 Python 训练引擎端引入 `threading.Lock()` 互斥锁，将 `forward → loss 计算 → backward → weight step` 完整链路纳入临界区，通过资源级串行化消除多线程对网络参数的并发写入风险。*( `gat_cpp/cpp_train.py` → `policy_update` 临界区)*
-
-#### 2.2.5 双后端切换与跨语言特征一致性验证
-
-系统同时保留纯 Python 自对弈流水作为回退选项，并封装了通过外部参数热切换自对弈引擎的调度接口。迁移过程中引入**状态对齐断言沙盒**：强制要求 C++ 环境生成的四维特征张量与 Python 侧对象输出实现比特级精确匹配，消除跨语言特征实现差异引入的系统性偏差。*( `verify_nn_mcts.py` + `bindings.cpp`)*
-
-#### 2.2.6 关键 Bug 修复记录
-
-在 C++ 后端集成过程中，定位并修复了以下两处隐蔽性高、影响范围大的底层缺陷：
-
-- **MCTS Q 值符号错误修复 (Q-Value Sign Correction)**：原始 C++ MCTS 实现中，节点行动价值 $Q$ 的正负号逻辑存在反转缺陷，导致搜索引擎系统性偏向访问最差节点而非最优节点，造成自博弈数据质量极低且策略网络无法收敛。定位后通过在 Backup 反传路径修正值域符号，彻底还原了正确的 PUCT 节点选择行为。*( `gat_cpp/src/mcts_stub.cpp` → `backup` 路径符号修正)*
-
-- **跨语言状态通道对齐修复 (RootSnapshot `last_move` Fix)**：C++ 端在构造根节点快照 (RootSnapshot) 时缺少 `last_move` 字段，导致传入 Python 神经网络的四通道特征张量中当前执子方通道数据错位，网络推理结果从输入层即引入系统性偏差。修复方式为在 `RootSnapshot` 结构体中补全 `last_move` 字段并同步至特征构造逻辑，恢复 C++ 与 Python 侧特征张量的完全一致性。*( `gat_cpp/src/mcts_stub.cpp` → `RootSnapshot` 结构体 + 特征构造通道校准)*
-
----
-
-## Phase 3：服务器集群部署与运维适配
-
-针对长周期大规模强化学习训练的生产部署需求，完成以下基础设施层面的工程适配：
-
-- **依赖环境闭环管理与编译系统 (Conda & CMake)**：建立标准化 Conda 依赖清单，实现环境一键复现；独立配置 C++ 模块的 `CMakeLists.txt / Makefile` 跨平台编译链，屏蔽宿主机 GCC / GLIBC 版本差异导致的依赖链问题。
-
-- **脱机后台驻留与日志分离 (Nohup / Supervisord)**：全训练流水支持 Nohup 等静默守护进程模式后台驻留运行，标准输出与错误日志分离重定向至持久化日志文件，保障在算力网关限制或 SSH 远程断连情况下训练进程的持续稳定运行。
-
----
-
-## 阶段性实验结果
-
-以下数据基于 11×11 棋盘 / 五子连珠规则 / 400 playout 纯 MCTS 基准对手的实验配置记录，反映各改造阶段模型训练的真实收敛表现：
-
-| 指标 | 观测值 |
-|---|---|
-| 评估对手 | 纯 MCTS（400 playout） |
-| 棋盘规格 | 11×11，五子连珠 |
-| 胜率区间（稳定期） | 0.65 ~ 0.80 |
-| 胜率峰值 | 0.85+ |
-| policy loss 收敛趋势 | 从初始 ~4.7 持续下降至 4.6 以下，仍处于下降区间 |
-| 训练稳定性 | 全程无 NaN 崩溃，无 Checkpoint 损坏记录 |
-
-上述结果表明：工程化改造后的训练闭环已进入稳定的正反馈收敛区间，模型策略质量持续优于纯蒙特卡洛随机搜索基准，验证了整体架构设计的有效性。后续计划在保持当前稳定性的前提下，适时将 `n_playout` 从 400 提升至 800，以进一步驱动策略精度增益。
+本次仅补充授权与来源说明，暂不为项目原创部分新增开源许可证。第三方代码和依赖仍适用原有许可证，不以本说明替换。

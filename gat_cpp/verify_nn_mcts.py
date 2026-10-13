@@ -262,7 +262,7 @@ def test_5_mini_training(mcts_cpp):
     
     # Train for a few steps and check loss decrease
     print(f"  Training on {len(all_data)} positions...")
-    from torch.optim import Adam
+    from pipeline.optimizer import Adam
     params, _ = net.get_all_params()
     optimizer = Adam(params, lr=2e-3)
     
@@ -292,7 +292,11 @@ def test_5_mini_training(mcts_cpp):
         total_loss = p_loss + v_loss
         
         optimizer.zero_grad()
-        total_loss.backward()
+        grad_policy = torch.zeros_like(act_probs)
+        grad_policy[:, :p_batch.shape[1]] = -p_batch / (act_probs_trimmed + 1e-10) / len(batch)
+        grad_value = 2 * (value - v_batch) / len(batch)
+        net.backward(grad_policy, grad_value)
+        assert torch.isfinite(total_loss), "Non-finite training loss"
         optimizer.step()
         
         losses.append({

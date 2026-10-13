@@ -4,7 +4,12 @@ __pycache__/
 .vscode/
 .idea/
 .venv/
-models/*.pth
+models/
 runs/
 gat_cpp/build/
 *.pyd
+*.log
+*.pth
+.env
+.env.*
+!.env.example

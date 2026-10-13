@@ -13,13 +13,13 @@ C++ scaffold for gomoku engine acceleration.
 1. Install build deps in active Python env:
 
 ```powershell
-pip install pybind11 cmake
+python -m pip install -r requirements-build.txt
 ```
 
 2. Configure and build:
 
 ```powershell
-cmake -S gat_cpp -B gat_cpp/build -DPython3_EXECUTABLE=c:/Users/26730/Desktop/CNN/.venv/Scripts/python.exe
+cmake -S gat_cpp -B gat_cpp/build -DPython3_EXECUTABLE=(python -c "import sys; print(sys.executable)")
 cmake --build gat_cpp/build --config Release
 ```
 
@@ -38,35 +38,33 @@ print(ai.get_action(b))
 1. Build module:
 
 ```powershell
-cmake -S gat_cpp -B gat_cpp/build -DPython3_EXECUTABLE=c:/Users/26730/Desktop/CNN/.venv/Scripts/python.exe
+cmake -S gat_cpp -B gat_cpp/build -DPython3_EXECUTABLE=(python -c "import sys; print(sys.executable)")
 cmake --build gat_cpp/build --config Release
 ```
 
 2. Run smoke test (parallel rollout path):
 
 ```powershell
-c:/Users/26730/Desktop/CNN/.venv/Scripts/python.exe gat_cpp/tools/run_parallel_smoke.py --playout 1600 --threads 8
+python gat_cpp/tools/run_parallel_smoke.py --playout 1600 --threads 8
 ```
 
 3. Validate auto thread mode:
 
 ```powershell
-c:/Users/26730/Desktop/CNN/.venv/Scripts/python.exe gat_cpp/tools/run_parallel_smoke.py --playout 1600 --threads 0
+python gat_cpp/tools/run_parallel_smoke.py --playout 1600 --threads 0
 ```
 
 4. Benchmark repeated get_action calls (persistent worker pool benefit):
 
 ```powershell
-c:/Users/26730/Desktop/CNN/.venv/Scripts/python.exe gat_cpp/tools/run_parallel_session_bench.py --playout 6400 --threads 8 --steps 20
+python gat_cpp/tools/run_parallel_session_bench.py --playout 6400 --threads 8 --steps 20
 ```
 
 Notes:
 - `AlphaZeroPlayer` now runs shared-tree parallel PUCT with virtual loss and persistent workers.
 - Worker threads are persistent across calls to reduce per-move thread creation overhead.
-- Throughput is lower than the previous pure-random rollout baseline, but search quality is stronger.
+- Measure throughput and playing strength separately for the selected hardware and search settings.
 
-## Next steps
+## Training and checkpoints
 
-- Add batch callback interface from C++ leaf nodes to Python torch inference.
-- Add tree reuse between consecutive moves (`update_with_move`) for further speedup.
-- Replace scalar value backup with neural value estimation from policy-value net.
+The training entry is `python gat_cpp/cpp_train.py --help`. Neural evaluation callbacks and tree reuse are implemented in the current source; benchmark them on your own workload. See the root README for a small Python-only smoke run, checkpoint v2 requirements, and authorization notes.

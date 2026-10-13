@@ -30,6 +30,7 @@ except ModuleNotFoundError:
 	from game import Board
 	from mcts_alphaZero import MCTSPlayer
 from pipeline.policy_value_net import PolicyValueNet
+from pipeline.checkpoint import validate_checkpoint
 
 
 @dataclass
@@ -131,25 +132,8 @@ class ModelPolicyAdapter:
 			self._activate_legacy_params(list(checkpoint))
 			return
 
-		params, _ = self.net.get_all_params()
-
-		if isinstance(checkpoint, dict) and "model_state" in checkpoint:
-			model_state = checkpoint["model_state"]
-		elif isinstance(checkpoint, dict):
-			# 兼容直接保存参数字典的情况
-			model_state = checkpoint
-		else:
-			raise ValueError("不支持的模型文件格式，预期为 dict/checkpoint")
-
-		loaded_keys = 0
-		for name, tensor in model_state.items():
-			if name in params and params[name] is not None and torch.is_tensor(tensor):
-				if tuple(params[name].shape) == tuple(tensor.shape):
-					params[name].data.copy_(tensor.to(params[name].device))
-					loaded_keys += 1
-
-		if loaded_keys == 0:
-			raise ValueError("模型加载失败：未匹配到任何网络参数，请检查棋盘尺寸或权重文件")
+		validate_checkpoint(checkpoint, self.net)
+		self.net.restore_state(checkpoint["model_state"])
 
 	def policy_value_fn(self, board: Board):
 		legal_positions = board.availables

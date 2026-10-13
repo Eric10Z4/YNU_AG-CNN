@@ -28,6 +28,7 @@ from cpp_mcts_pure import MCTSPlayer as MCTS_Pure
 # 导入手搓组件
 from pipeline.policy_value_net import PolicyValueNet
 from pipeline.optimizer import Adam
+from pipeline.checkpoint import validate_checkpoint
 from pipeline.losses import combined_loss
 
 
@@ -147,7 +148,7 @@ class CppSelfPlayPlayer:
 
 
 class TrainPipeline:
-    def __init__(self, board_size=11, n_in_row=5, fresh_start=False):
+    def __init__(self, board_size=11, n_in_row=5, fresh_start=False, selfplay_backend="cpp", eval_backend="cpp"):
         # 基础参数
         self.board_width, self.board_height, self.n_in_row = int(board_size), int(board_size), int(n_in_row)
         if self.board_width < self.n_in_row:
@@ -165,8 +166,8 @@ class TrainPipeline:
         self.cpu_count = max(1, multiprocessing.cpu_count())
         self.n_playout = 400
         self.c_puct = 5
-        self.selfplay_backend = "cpp"
-        self.eval_backend = "cpp"
+        self.selfplay_backend = selfplay_backend
+        self.eval_backend = eval_backend
         # 默认线程数偏稳健，避免高线程争用吞掉有效吞吐
         self.cpp_threads = max(4, min(16, self.cpu_count // 8))
         self.torch_cpu_threads = 1
@@ -194,7 +195,7 @@ class TrainPipeline:
         self.high_kl_patience = 20
         self.eval_decline_patience = 30
         self.nan_retry_limit = 1
-        self.model_dir = os.path.join(ROOT_DIR, "models")
+        self.model_dir = os.path.join(ROOT_DIR, "models", f"{self.board_width}x{self.board_height}_n{self.n_in_row}")
         self.log_dir = os.path.join(ROOT_DIR, "runs")  # TensorBoard 根目录
         self.current_model_path = os.path.join(self.model_dir, "current_policy.pth")
         self.best_model_path = os.path.join(self.model_dir, "best_policy.pth")
@@ -935,18 +936,10 @@ class TrainPipeline:
         return self._policy_evaluate_python(n_games=n_games)
 
     def _capture_model_state(self):
-        params, _ = self.policy_value_net.get_all_params()
-        return {k: v.detach().cpu().clone() for k, v in params.items() if v is not None}
+        return self.policy_value_net.capture_state()
 
     def _restore_model_state(self, model_state):
-        params, _ = self.policy_value_net.get_all_params()
-        loaded_keys = 0
-        for name, tensor in model_state.items():
-            if name in params and params[name] is not None:
-                if tuple(params[name].shape) == tuple(tensor.shape):
-                    params[name].data.copy_(tensor.to(params[name].device))
-                    loaded_keys += 1
-        return loaded_keys
+        self.policy_value_net.restore_state(model_state)
 
     def _capture_optimizer_state(self):
         state = {}
@@ -982,6 +975,9 @@ class TrainPipeline:
 
     def _save_model(self, path, include_buffer=True):
         checkpoint = {
+            "format_version": 2,
+            "model_spec": self.policy_value_net.checkpoint_spec(),
+            "n_in_row": self.n_in_row,
             "model_state": self._capture_model_state(),
             "optimizer_state": self._capture_optimizer_state(),
             "best_win_ratio": self.best_win_ratio,
@@ -1006,12 +1002,8 @@ class TrainPipeline:
         if not os.path.exists(path):
             return False
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if "model_state" not in checkpoint:
-            return False
-        loaded_keys = self._restore_model_state(checkpoint["model_state"])
-        if loaded_keys == 0:
-            # 常见于 8x8 checkpoint 误加载到 11x11 模型，直接按未命中处理
-            return False
+        validate_checkpoint(checkpoint, self.policy_value_net, self.n_in_row)
+        self._restore_model_state(checkpoint["model_state"])
         self._restore_optimizer_state(checkpoint.get("optimizer_state"))
         if not restore_training_state:
             return True
@@ -1137,6 +1129,8 @@ if __name__ == '__main__':
         board_size=args.board_size,
         n_in_row=args.n_in_row,
         fresh_start=args.fresh_start,
+        selfplay_backend=args.selfplay_backend,
+        eval_backend=args.eval_backend,
     )
     if args.n_playout is not None:
         pipeline.n_playout = int(args.n_playout)
@@ -1172,4 +1166,5 @@ if __name__ == '__main__':
     pipeline._build_selfplay_player(log_prefix="CLI覆盖|")
     pipeline._log(f"CLI覆盖|评估后端: {pipeline.eval_backend}")
 
+    pipeline._save_config_snapshot()
     pipeline.run()

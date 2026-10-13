@@ -63,7 +63,7 @@ def run_ignition_test():
     if 'W' in conv1.grads and conv1.grads['W'] is not None:
          print(f"Conv2D weight grad OK, shape: {conv1.grads['W'].shape}")
     else:
-         print("Conv2D weight grad FAILED!")
+         raise AssertionError("Conv2D weight gradient is missing")
 
     print("="*50)
     print("All tests passed!")

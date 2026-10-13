@@ -23,6 +23,7 @@ class PolicyValueNet(nn.Module):
     def __init__(self, board_size=8, num_channels=128, device='cuda'):
         super().__init__()
         self.board_size = board_size
+        self.num_channels = num_channels
         self.device = device
         
         # 公共特征提取层
@@ -144,6 +145,41 @@ class PolicyValueNet(nn.Module):
         
         return params, grads
     
+    def checkpoint_spec(self):
+        return {"architecture": "manual-policy-value-v1", "board_size": self.board_size,
+                "num_channels": self.num_channels}
+
+    def _state_tensors(self):
+        tensors = dict(self.get_all_params()[0])
+        for name, layer in self._named_layers().items():
+            if isinstance(layer, BatchNorm2D):
+                tensors[name + ".running_mean"] = layer.running_mean
+                tensors[name + ".running_var"] = layer.running_var
+        return tensors
+
+    def capture_state(self):
+        return {name: value.detach().cpu().clone() for name, value in self._state_tensors().items()}
+
+    def validate_state(self, state):
+        expected = self._state_tensors()
+        if not isinstance(state, dict) or set(state) != set(expected):
+            raise ValueError("Incomplete model state (including BatchNorm statistics); old checkpoints require retraining or an explicit migration.")
+        for name, target in expected.items():
+            value = state[name]
+            if not torch.is_tensor(value) or value.shape != target.shape or value.dtype != target.dtype:
+                raise ValueError("Incompatible model tensor: " + name)
+            if not torch.isfinite(value).all():
+                raise ValueError("Non-finite model tensor: " + name)
+            if name.endswith(".running_var") and (value < 0).any():
+                raise ValueError("Negative BatchNorm variance: " + name)
+
+    def restore_state(self, state):
+        # Validate every tensor before mutating any parameter or buffer.
+        self.validate_state(state)
+        with torch.no_grad():
+            for name, target in self._state_tensors().items():
+                target.copy_(state[name].to(target.device))
+
     def zero_grad(self):
         """清空所有梯度"""
         for _, layer in self._named_layers().items():

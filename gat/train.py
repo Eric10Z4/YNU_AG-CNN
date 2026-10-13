@@ -23,6 +23,7 @@ from mcts_pure import MCTSPlayer as MCTS_Pure
 # 导入手搓组件
 from pipeline.policy_value_net import PolicyValueNet
 from pipeline.optimizer import Adam
+from pipeline.checkpoint import validate_checkpoint
 from pipeline.losses import combined_loss
 
 
@@ -57,7 +58,7 @@ class TrainPipeline:
         self.high_kl_patience = 10
         self.eval_decline_patience = 10
         self.nan_retry_limit = 1
-        self.model_dir = os.path.join(ROOT_DIR, "models")
+        self.model_dir = os.path.join(ROOT_DIR, "models", f"{self.board_width}x{self.board_height}_n{self.n_in_row}")
         self.log_dir = os.path.join(ROOT_DIR, "runs")
         self.current_model_path = os.path.join(self.model_dir, "current_policy.pth")
         self.best_model_path = os.path.join(self.model_dir, "best_policy.pth")
@@ -452,14 +453,10 @@ class TrainPipeline:
         return win_ratio
 
     def _capture_model_state(self):
-        params, _ = self.policy_value_net.get_all_params()
-        return {k: v.detach().cpu().clone() for k, v in params.items() if v is not None}
+        return self.policy_value_net.capture_state()
 
     def _restore_model_state(self, model_state):
-        params, _ = self.policy_value_net.get_all_params()
-        for name, tensor in model_state.items():
-            if name in params and params[name] is not None:
-                params[name].data.copy_(tensor.to(params[name].device))
+        self.policy_value_net.restore_state(model_state)
 
     def _capture_optimizer_state(self):
         state = {}
@@ -495,6 +492,9 @@ class TrainPipeline:
 
     def _save_model(self, path, include_buffer=True):
         checkpoint = {
+            "format_version": 2,
+            "model_spec": self.policy_value_net.checkpoint_spec(),
+            "n_in_row": self.n_in_row,
             "model_state": self._capture_model_state(),
             "optimizer_state": self._capture_optimizer_state(),
             "best_win_ratio": self.best_win_ratio,
@@ -519,8 +519,7 @@ class TrainPipeline:
         if not os.path.exists(path):
             return False
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if "model_state" not in checkpoint:
-            return False
+        validate_checkpoint(checkpoint, self.policy_value_net, self.n_in_row)
         self._restore_model_state(checkpoint["model_state"])
         self._restore_optimizer_state(checkpoint.get("optimizer_state"))
         if not restore_training_state:
