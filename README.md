@@ -1,16 +1,29 @@
-# YNU_AG-CNN：AlphaZero 五子棋实验
+# YNU_AG-CNN：手写 CNN 与并行 MCTS 的 AlphaZero 五子棋系统
 
-结合手写 CNN 前向 / 反向传播与蒙特卡洛树搜索的五子棋学习项目，包含 Python 训练流程和可选 C++ 搜索后端。原始思路与部分实现基于 [AlphaZero_Gomoku](https://github.com/junxiaosong/AlphaZero_Gomoku)，来源与授权边界见 [AUTHORIZATION.md](AUTHORIZATION.md)。
+围绕“**手写神经网络 → 策略价值预测 → MCTS 搜索 → 自博弈训练**”构建的强化学习实验项目。项目以 PyTorch 张量为计算基础，手动实现网络前向与反向传播，并接入可选的 C++ 搜索后端，连接底层数值计算、决策搜索与训练工程。
 
-项目用于学习和实验，训练效果取决于棋盘、模拟次数、随机种子、硬件和训练时长。当前仓库没有可据以复核旧胜率描述的完整模型与评估数据，因此不作性能或逐位复现保证。
+**技术栈：** Python · C++17 · PyTorch · NumPy · pybind11 · CMake · TensorBoard
+
+## 项目实现要点
+
+| 方向 | 实现内容 | 代码入口 |
+| --- | --- | --- |
+| 手写 CNN | 卷积、BatchNorm、线性层及对应梯度计算；组合策略头与价值头 | [core](core/)、[policy_value_net.py](pipeline/policy_value_net.py) |
+| 自博弈学习 | 由搜索结果生成策略目标，结合对局结果更新网络，维护经验回放与评估过程 | [Python 训练](gat/train.py)、[训练入口](gat_cpp/cpp_train.py) |
+| C++ 搜索后端 | 棋盘状态、共享搜索树、virtual loss、常驻工作线程与神经网络批量评估接口 | [mcts_stub.cpp](gat_cpp/src/mcts_stub.cpp)、[bindings.cpp](gat_cpp/src/bindings.cpp) |
+| 训练可靠性 | 完整网络存档、恢复前校验、随机状态记录、配置快照与训练日志 | [checkpoint.py](pipeline/checkpoint.py)、[回归测试](tests/test_checkpoint.py) |
+
+这些模块提供了从算子实现到搜索决策的可阅读路径，也便于在同一任务下对比 Python 与 C++ 后端的行为。具体运行方式、检查点格式和验证范围见下文。
+
+原始思路与部分实现基于 [AlphaZero_Gomoku](https://github.com/junxiaosong/AlphaZero_Gomoku)。项目实现包含团队协作与上游工作，来源和授权边界见 [AUTHORIZATION.md](AUTHORIZATION.md)。
 
 ## 目录
 
 | 目录 | 用途 |
 | --- | --- |
-| `core/` | 棋盘、搜索与底层算子 |
+| `core/` | 手写卷积、归一化、线性层、激活及基础算子 |
 | `pipeline/` | 手写策略价值网络、优化器、检查点验证 |
-| `gat/` | Python 训练和人机对弈入口 |
+| `gat/` | Python 棋盘、搜索、训练和人机对弈入口 |
 | `gat_cpp/` | C++ 棋盘与搜索、Python 绑定及训练入口 |
 | `tests/` | 检查点完整性与真实梯度更新的回归检查 |
 
@@ -66,6 +79,12 @@ python gat_cpp/tools/run_parallel_smoke.py --playout 32 --threads 2
 
 配置快照在命令行覆盖与线程调优后更新。训练输出、模型、运行日志与本地配置已加入忽略规则，不提交个人路径、私有数据或服务凭据。
 
+## 验证范围
+
+已通过检查点 / 梯度回归、底层网络前后向检查、小棋盘 Python 自博弈，以及 Linux 上的 C++ 构建和搜索检查。它们用于验证工程链路，不代表棋力或训练收敛结论。
+
+性能对比需同时记录棋盘尺寸、模拟次数、线程数、硬件和随机种子；当前仓库尚未提供可复核旧胜率描述的完整模型与评估数据。
+
 ## 授权
 
-本次仅补充授权与来源说明，暂不为项目原创部分新增开源许可证。第三方代码和依赖仍适用原有许可证，不以本说明替换。
+项目原创部分尚未提供统一开源许可证，来源与授权边界见 [AUTHORIZATION.md](AUTHORIZATION.md)。第三方代码和依赖仍适用原有许可证。
